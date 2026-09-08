@@ -334,8 +334,8 @@ func TestCleanupGraceBoundary(t *testing.T) {
 
 func TestBackwardClockEntryIsNotStrandedBehindCursor(t *testing.T) {
 	cache, clock := newTestCache(6000, DefaultConfig())
-	if cache.state.cleanedMinute != 95 {
-		t.Fatalf("initial cleaned minute = %d, want 95", cache.state.cleanedMinute)
+	if cache.state.cleanedMinute != 99 {
+		t.Fatalf("initial cleaned minute = %d, want 99", cache.state.cleanedMinute)
 	}
 
 	clock.Set(5700)

@@ -14,7 +14,7 @@ const DefaultMaxTTLSeconds int64 = 24 * 60 * 60
 const (
 	clockUpdateInterval = time.Second
 	workerBatchSize     = 4 * 1024
-	cleanupGraceMinutes = int64(5)
+	cleanupGraceMinutes = int64(1)
 	secondsPerMinute    = int64(60)
 )
 
