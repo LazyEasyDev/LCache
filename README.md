@@ -40,7 +40,7 @@ func main() {
 
 	local.Set("user:42", "Alice", 60)
 
-	value, expiresAtUnix, found := local.Get("user:42")
+	value, found := local.Get("user:42")
 	if !found {
 		fmt.Println("cache miss")
 		return
@@ -52,7 +52,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("%s expires at %d\n", name, expiresAtUnix)
+	fmt.Println(name)
 }
 ```
 
@@ -89,17 +89,16 @@ new key or replace an existing value.
 ### `Get`
 
 ```go
-value, expiresAtUnix, found := local.Get(key)
+value, found := local.Get(key)
 ```
 
-Returns a value only while it is live. On a miss, it returns `nil, 0, false`.
+Returns a value only while it is live. On a miss, it returns `nil, false`.
 The `found` result distinguishes a stored nil value from a missing key.
 
-`expiresAtUnix` is the absolute Unix-second deadline. Convert the returned
-`any` value with a type assertion:
+Convert the returned `any` value with a type assertion:
 
 ```go
-value, _, found := local.Get("user:42")
+value, found := local.Get("user:42")
 if found {
 	name, ok := value.(string)
 	if !ok {
@@ -108,6 +107,20 @@ if found {
 	_ = name
 }
 ```
+
+### `GetWithTTL`
+
+```go
+value, expiresAtUnix, remainingTTLSeconds, found := local.GetWithTTL(key)
+```
+
+Returns the same live value as `Get` together with its absolute Unix-second
+deadline and remaining complete TTL seconds. On a miss, it returns
+`nil, 0, 0, false`.
+
+The remaining TTL is calculated from the same cached clock used to decide
+whether the entry is live. It may be zero while `found` is true when the entry
+is in its final partial second.
 
 ### `Touch`
 
@@ -145,10 +158,17 @@ usable, and its maintenance worker continues running.
 ```go
 stats := local.Stats()
 fmt.Println(stats.Total)
+fmt.Println(stats.Count(reflect.TypeOf("")))
 
-for typ, count := range stats.ByType {
-	fmt.Printf("%v: %d\n", typ, count)
+for _, typeCount := range stats.ByType {
+	fmt.Printf("%v: %d\n", typeCount.Type, typeCount.Count)
 }
+
+encoded, err := stats.ToJSON()
+if err != nil {
+	return
+}
+fmt.Println(string(encoded))
 ```
 
 `Stats` returns an independent snapshot:
@@ -156,9 +176,28 @@ for typ, count := range stats.ByType {
 ```go
 type Stats struct {
 	Total  int
-	ByType map[reflect.Type]int
+	ByType []TypeCount
+}
+
+type TypeCount struct {
+	Type  reflect.Type
+	Count int
 }
 ```
+
+`Count` returns the resident count for one `reflect.Type`. It returns zero when
+the type is absent. Use `stats.Count(nil)` for bare nil values. `ByType` is
+ordered from highest to lowest count. Types with equal counts have no
+guaranteed relative order.
+
+`ToJSON` preserves the `ByType` order and returns compact JSON:
+
+```json
+{"total":3,"byType":[{"type":"string","count":2},{"type":null,"count":1}]}
+```
+
+Concrete types are encoded using `reflect.Type.String()`. A bare nil type is
+encoded as JSON `null`.
 
 The counts describe physically resident records. They can temporarily include
 expired entries that already produce misses but have not reached background
@@ -186,7 +225,8 @@ whole seconds.
 
 Logical expiration and physical cleanup are separate:
 
-- `Get`, `Touch`, and `Delete` use the exact second-based deadline.
+- `Get`, `GetWithTTL`, `Touch`, and `Delete` use the exact second-based
+	deadline.
 - The worker removes old records in minute buckets and bounded batches.
 - Physical removal normally occurs within about one minute after the exact
 	deadline, and later if the worker is delayed or has a backlog.
@@ -232,11 +272,14 @@ nondeterministic and is not guaranteed before process exit.
 | Operation | Expected cost |
 | --- | --- |
 | `Get` | O(1) |
+| `GetWithTTL` | O(1) |
 | `Set` | O(1) |
 | `Touch` | O(1) |
 | `Delete` | O(1) |
 | `Clear` | O(1) map replacement |
-| `Stats` | O(t), where `t` is the number of represented value types |
+| `Stats.Count` | O(t), where `t` is the number of represented value types |
+| `Stats.ToJSON` | O(t) |
+| `Stats` | O(t log t) to copy and order represented value types |
 | Cleanup | O(m + k) across elapsed minutes and removed records |
 
 Resident index space is O(n) plus one map entry per occupied expiration

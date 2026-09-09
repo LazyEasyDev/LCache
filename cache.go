@@ -2,9 +2,11 @@
 package cache
 
 import (
+	"encoding/json"
 	"math"
 	"reflect"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,14 +35,54 @@ func DefaultConfig() Config {
 	return Config{MaxTTLSeconds: DefaultMaxTTLSeconds}
 }
 
+// TypeCount associates a stored value type with its resident entry count.
+type TypeCount struct {
+	Type  reflect.Type
+	Count int
+}
+
 // Stats is a snapshot of physically resident cache entries.
 type Stats struct {
 	// Total is the number of physically resident entries, including expired
 	// entries that have not yet been removed by background cleanup.
 	Total int
-	// ByType maps each stored value's dynamic type to its resident entry count.
-	// A bare nil value is counted under a nil reflect.Type key.
-	ByType map[reflect.Type]int
+	// ByType contains resident entry counts ordered from highest to lowest.
+	// A bare nil value has a nil Type. Equal-count ordering is unspecified.
+	ByType []TypeCount
+}
+
+// Count returns the resident entry count for typ. It returns zero when typ is
+// absent or when Stats is the zero value.
+func (s Stats) Count(typ reflect.Type) int {
+	for _, typeCount := range s.ByType {
+		if typeCount.Type == typ {
+			return typeCount.Count
+		}
+	}
+	return 0
+}
+
+// ToJSON encodes the Stats snapshot as JSON while preserving ByType order.
+// Type names are strings, and the type of a bare nil value is JSON null.
+func (s Stats) ToJSON() ([]byte, error) {
+	type jsonTypeCount struct {
+		Type  *string `json:"type"`
+		Count int     `json:"count"`
+	}
+	type jsonStats struct {
+		Total  int             `json:"total"`
+		ByType []jsonTypeCount `json:"byType"`
+	}
+
+	byType := make([]jsonTypeCount, len(s.ByType))
+	for index, typeCount := range s.ByType {
+		byType[index].Count = typeCount.Count
+		if typeCount.Type != nil {
+			typeName := typeCount.Type.String()
+			byType[index].Type = &typeName
+		}
+	}
+	return json.Marshal(jsonStats{Total: s.Total, ByType: byType})
 }
 
 type entry struct {
@@ -156,21 +198,46 @@ func (c *Cache) Set(key string, value any, ttlSeconds int64) {
 	state.typeCounts[record.typ]++
 }
 
-// Get returns a live value and its absolute Unix-second expiration deadline.
-// It returns nil, 0, false when key is absent or expired.
-func (c *Cache) Get(key string) (value any, expiresAtUnix int64, found bool) {
+// Get returns the live value stored under key. It returns nil, false when key
+// is absent or expired.
+func (c *Cache) Get(key string) (value any, found bool) {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
+	value, _, _, found = state.get(key)
+	return value, found
+}
+
+// GetWithTTL returns the live value stored under key, its absolute Unix-second
+// expiration deadline, and its remaining complete TTL seconds. The remaining
+// TTL may be zero while the entry is live in its final partial second. It
+// returns nil, 0, 0, false when key is absent or expired.
+func (c *Cache) GetWithTTL(key string) (value any, expiresAtUnix, remainingTTLSeconds int64, found bool) {
+	state := c.state
+	defer runtime.KeepAlive(c)
+
+	value, expiresAtUnix, nowUnix, found := state.get(key)
+	if !found {
+		return nil, 0, 0, false
+	}
+	return value, expiresAtUnix, expiresAtUnix - nowUnix - 1, true
+}
+
+func (state *cacheState) get(key string) (value any, expiresAtUnix, nowUnix int64, found bool) {
 	state.mu.RLock()
 	record, found := state.entries[key]
-	if !found || record.expiresAtUnix <= state.cachedNowUnix.Load() {
+	if !found {
 		state.mu.RUnlock()
-		return nil, 0, false
+		return nil, 0, 0, false
+	}
+	nowUnix = state.cachedNowUnix.Load()
+	if record.expiresAtUnix <= nowUnix {
+		state.mu.RUnlock()
+		return nil, 0, 0, false
 	}
 	value, expiresAtUnix = record.value, record.expiresAtUnix
 	state.mu.RUnlock()
-	return value, expiresAtUnix, true
+	return value, expiresAtUnix, nowUnix, true
 }
 
 // Touch changes the TTL of a live entry and reports whether one exists. A TTL
@@ -248,12 +315,15 @@ func (c *Cache) Stats() Stats {
 	state.mu.RLock()
 	stats := Stats{
 		Total:  len(state.entries),
-		ByType: make(map[reflect.Type]int, len(state.typeCounts)),
+		ByType: make([]TypeCount, 0, len(state.typeCounts)),
 	}
 	for typ, count := range state.typeCounts {
-		stats.ByType[typ] = count
+		stats.ByType = append(stats.ByType, TypeCount{Type: typ, Count: count})
 	}
 	state.mu.RUnlock()
+	sort.Slice(stats.ByType, func(left, right int) bool {
+		return stats.ByType[left].Count > stats.ByType[right].Count
+	})
 	return stats
 }
 

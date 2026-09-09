@@ -24,7 +24,8 @@ or goroutine per key, and keeps cleanup lock holds bounded by a work count.
 
 ## Goals
 
-- Concurrent `Get`, `Set`, `Touch`, `Delete`, `Clear`, and `Stats` operations.
+- Concurrent `Get`, `GetWithTTL`, `Set`, `Touch`, `Delete`, `Clear`, and
+	`Stats` operations.
 - Expected O(1) lookup, mutation, and expiration-index maintenance.
 - Exact second-based logical expiration using a low-cost cached clock.
 - One expiration-index record for every physically resident entry.
@@ -58,14 +59,28 @@ type Config struct {
 
 func DefaultConfig() Config
 
+type TypeCount struct {
+	Type  reflect.Type
+	Count int
+}
+
 type Stats struct {
 	Total  int
-	ByType map[reflect.Type]int
+	ByType []TypeCount
 }
+
+func (s Stats) Count(typ reflect.Type) int
+func (s Stats) ToJSON() ([]byte, error)
 
 func New(config Config) *Cache
 func (c *Cache) Set(key string, value any, ttlSeconds int64)
-func (c *Cache) Get(key string) (value any, expiresAtUnix int64, found bool)
+func (c *Cache) Get(key string) (value any, found bool)
+func (c *Cache) GetWithTTL(key string) (
+	value any,
+	expiresAtUnix int64,
+	remainingTTLSeconds int64,
+	found bool,
+)
 func (c *Cache) Touch(key string, ttlSeconds int64) bool
 func (c *Cache) Delete(key string) bool
 func (c *Cache) Clear()
@@ -79,7 +94,8 @@ the configured value is outside the inclusive range `1..86400`.
 
 | Operation | Live key | Expired key | Missing key |
 | --- | --- | --- | --- |
-| `Get` | returns value, deadline, `true` | returns `nil, 0, false` | returns `nil, 0, false` |
+| `Get` | returns value, `true` | returns `nil, false` | returns `nil, false` |
+| `GetWithTTL` | returns value, deadline, remaining TTL, `true` | returns `nil, 0, 0, false` | returns `nil, 0, 0, false` |
 | `Set`, positive TTL | replaces value and deadline | replaces value and deadline | inserts value and deadline |
 | `Set`, non-positive TTL | no-op | no-op | no-op |
 | `Touch`, positive TTL | replaces deadline, returns `true` | no-op, returns `false` | returns `false` |
@@ -90,9 +106,16 @@ the configured value is outside the inclusive range `1..86400`.
 ordered after it by the cache mutex observe an empty cache. The cache remains
 usable and the worker lifecycle is unchanged.
 
-`Stats` returns a snapshot with a newly allocated `ByType` map. Mutating that
-map cannot affect the cache. Counts include all physically resident records,
-including logically expired records awaiting cleanup.
+`Stats` returns a snapshot with a newly allocated `ByType` slice sorted from
+highest to lowest count; equal-count ordering is unspecified. Mutating that
+slice cannot affect the cache. `Stats.Count` scans the snapshot and returns
+zero when the type is absent or the snapshot is the zero value. Counts include
+all physically resident records, including logically expired records awaiting
+cleanup.
+
+`Stats.ToJSON` encodes `Total` and the ordered `ByType` slice using lower-case
+JSON field names. Concrete types use `reflect.Type.String()`, and a bare nil
+type is encoded as JSON `null`. The returned bytes are independently allocated.
 
 ### Keys and Values
 
@@ -198,8 +221,16 @@ An entry is live precisely when:
 entry.expiresAtUnix > cachedNowUnix
 ```
 
-Equality is expired. The deadline returned by `Get` is an absolute Unix-second
-value, not a remaining TTL.
+Equality is expired. `GetWithTTL` returns the stored deadline as an absolute
+Unix-second value. It also calculates the number of complete seconds remaining
+from the cached clock used for the same lookup:
+
+```go
+remainingTTLSeconds = expiresAtUnix - cachedNowUnix - 1
+```
+
+The result can be zero while the entry remains live in its final partial
+second.
 
 `time.Now().Unix()` truncates subsecond time. To ensure at least the requested
 number of whole seconds under a normally advancing clock, `Set` and positive
@@ -218,11 +249,11 @@ clock near the integer limit.
 `New` initializes `cachedNowUnix` synchronously. The worker refreshes it from
 `state.clock` about once per second using `atomic.Int64`.
 
-`Get`, `Touch`, and `Delete` use this cached value to decide whether an entry
-is live. They therefore avoid a system clock call, but can observe an entry as
-live briefly after its wall-clock deadline. The normal lag is around one
-second; scheduling delays and process suspension mean there is no hard upper
-bound.
+`Get`, `GetWithTTL`, `Touch`, and `Delete` use this cached value to decide
+whether an entry is live. They therefore avoid a system clock call, but can
+observe an entry as live briefly after its wall-clock deadline. The normal lag
+is around one second; scheduling delays and process suspension mean there is
+no hard upper bound.
 
 `Set` and positive `Touch` sample `state.clock` directly when creating a new
 deadline. A stale cached read clock therefore cannot shorten a newly assigned
@@ -394,7 +425,7 @@ alter worker lifecycle.
 ## Concurrency Model
 
 - `mu` protects `entries`, `minuteBuckets`, `cleanedMinute`, and `typeCounts`.
-- `Get` and `Stats` use the read lock.
+- `Get`, `GetWithTTL`, and `Stats` use the read lock.
 - Mutations and cleanup use the write lock.
 - `cachedNowUnix` is published and loaded atomically.
 - The injected `clock` is read directly only when creating deadlines,
@@ -410,11 +441,14 @@ contention benefit and a design that preserves those cross-index invariants.
 | Path | Expected work |
 | --- | --- |
 | `Get` | O(1) |
+| `GetWithTTL` | O(1) |
 | `Set` | O(1) |
 | `Touch` | O(1) |
 | `Delete` | O(1) |
 | `Clear` | O(1) map replacement |
-| `Stats` | O(t) map copy for `t` represented types |
+| `Stats.Count` | O(t) for `t` represented types |
+| `Stats.ToJSON` | O(t) serialization work |
+| `Stats` | O(t log t) to copy and order represented value types |
 | Cleanup | O(m + k) for elapsed minute positions and processed records |
 
 Logical index space is O(n) entries plus O(b) occupied minute buckets. Go map

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 )
 
 type fakeClock struct {
@@ -119,8 +120,8 @@ func TestNegativeClockIsClampedToUnixEpoch(t *testing.T) {
 	}
 
 	cache.Set("key", "value", 1)
-	if _, expiresAtUnix, found := cache.Get("key"); !found || expiresAtUnix != 2 {
-		t.Fatalf("Get after negative clock Set = (_, %d, %v), want (_, 2, true)", expiresAtUnix, found)
+	if _, expiresAtUnix, remainingTTLSeconds, found := cache.GetWithTTL("key"); !found || expiresAtUnix != 2 || remainingTTLSeconds != 1 {
+		t.Fatalf("GetWithTTL after negative clock Set = (_, %d, %d, %v), want (_, 2, 1, true)", expiresAtUnix, remainingTTLSeconds, found)
 	}
 
 	clock.Set(-1)
@@ -137,19 +138,19 @@ func TestSetGetAndExpirationBoundary(t *testing.T) {
 	cache, clock := newTestCache(100, DefaultConfig())
 	cache.Set("", "value", 1)
 
-	value, expiresAtUnix, found := cache.Get("")
-	if !found || value != "value" || expiresAtUnix != 102 {
-		t.Fatalf("Get before deadline = (%v, %d, %v), want (value, 102, true)", value, expiresAtUnix, found)
+	value, expiresAtUnix, remainingTTLSeconds, found := cache.GetWithTTL("")
+	if !found || value != "value" || expiresAtUnix != 102 || remainingTTLSeconds != 1 {
+		t.Fatalf("GetWithTTL before deadline = (%v, %d, %d, %v), want (value, 102, 1, true)", value, expiresAtUnix, remainingTTLSeconds, found)
 	}
 
 	setTestTime(cache, clock, 101)
-	if _, _, found := cache.Get(""); !found {
+	if _, _, remainingTTLSeconds, found := cache.GetWithTTL(""); !found || remainingTTLSeconds != 0 {
 		t.Fatal("entry expired before its deadline")
 	}
 
 	setTestTime(cache, clock, 102)
-	if value, expiresAtUnix, found := cache.Get(""); found || value != nil || expiresAtUnix != 0 {
-		t.Fatalf("Get at deadline = (%v, %d, %v), want miss", value, expiresAtUnix, found)
+	if value, expiresAtUnix, remainingTTLSeconds, found := cache.GetWithTTL(""); found || value != nil || expiresAtUnix != 0 || remainingTTLSeconds != 0 {
+		t.Fatalf("GetWithTTL at deadline = (%v, %d, %d, %v), want miss", value, expiresAtUnix, remainingTTLSeconds, found)
 	}
 	assertIndexInvariant(t, cache)
 }
@@ -160,11 +161,11 @@ func TestSetNonPositiveTTLIsNoOp(t *testing.T) {
 	cache.Set("key", "second", 0)
 	cache.Set("missing", "value", -1)
 
-	value, expiresAtUnix, found := cache.Get("key")
+	value, expiresAtUnix, _, found := cache.GetWithTTL("key")
 	if !found || value != "first" || expiresAtUnix != 111 {
 		t.Fatalf("existing entry changed: (%v, %d, %v)", value, expiresAtUnix, found)
 	}
-	if _, _, found := cache.Get("missing"); found {
+	if _, found := cache.Get("missing"); found {
 		t.Fatal("non-positive TTL inserted a missing key")
 	}
 	assertIndexInvariant(t, cache)
@@ -173,9 +174,9 @@ func TestSetNonPositiveTTLIsNoOp(t *testing.T) {
 func TestTTLClampAndSaturation(t *testing.T) {
 	cache, _ := newTestCache(100, Config{MaxTTLSeconds: 10})
 	cache.Set("clamped", 1, 100)
-	_, expiresAtUnix, found := cache.Get("clamped")
-	if !found || expiresAtUnix != 111 {
-		t.Fatalf("clamped deadline = %d, found = %v, want 111 and true", expiresAtUnix, found)
+	_, expiresAtUnix, remainingTTLSeconds, found := cache.GetWithTTL("clamped")
+	if !found || expiresAtUnix != 111 || remainingTTLSeconds != 10 {
+		t.Fatalf("clamped deadline = %d, remaining TTL = %d, found = %v, want 111, 10, and true", expiresAtUnix, remainingTTLSeconds, found)
 	}
 
 	if got := expirationDeadline(math.MaxInt64-2, 10); got != math.MaxInt64 {
@@ -195,7 +196,7 @@ func TestNilValuesAndStats(t *testing.T) {
 	cache.Set("typed-nil", typedNil, 60)
 	cache.Set("number", 42, 60)
 
-	value, _, found := cache.Get("nil")
+	value, found := cache.Get("nil")
 	if !found || value != nil {
 		t.Fatalf("bare nil Get = (%v, %v), want (nil, true)", value, found)
 	}
@@ -204,21 +205,86 @@ func TestNilValuesAndStats(t *testing.T) {
 	if stats.Total != 3 {
 		t.Fatalf("Stats.Total = %d, want 3", stats.Total)
 	}
-	if stats.ByType[nil] != 1 || stats.ByType[reflect.TypeOf(typedNil)] != 1 || stats.ByType[reflect.TypeOf(42)] != 1 {
+	if stats.Count(nil) != 1 || stats.Count(reflect.TypeOf(typedNil)) != 1 || stats.Count(reflect.TypeOf(42)) != 1 {
 		t.Fatalf("unexpected type counts: %#v", stats.ByType)
 	}
+	if got := stats.Count(reflect.TypeOf("")); got != 0 {
+		t.Fatalf("missing type count = %d, want 0", got)
+	}
+	if got := (Stats{}).Count(reflect.TypeOf(42)); got != 0 {
+		t.Fatalf("zero-value Stats count = %d, want 0", got)
+	}
 
-	stats.ByType[nil] = 99
-	if got := cache.Stats().ByType[nil]; got != 1 {
+	for index := range stats.ByType {
+		if stats.ByType[index].Type == nil {
+			stats.ByType[index].Count = 99
+		}
+	}
+	if got := cache.Stats().Count(nil); got != 1 {
 		t.Fatalf("mutating Stats snapshot changed cache count to %d", got)
 	}
 
 	cache.Set("number", "forty-two", 60)
 	stats = cache.Stats()
-	if stats.ByType[reflect.TypeOf(42)] != 0 || stats.ByType[reflect.TypeOf("")] != 1 {
+	if stats.Count(reflect.TypeOf(42)) != 0 || stats.Count(reflect.TypeOf("")) != 1 {
 		t.Fatalf("unexpected replacement counts: %#v", stats.ByType)
 	}
 	assertIndexInvariant(t, cache)
+}
+
+func TestStatsOrdersTypesByCount(t *testing.T) {
+	cache, _ := newTestCache(100, DefaultConfig())
+	cache.Set("string:1", "one", 60)
+	cache.Set("string:2", "two", 60)
+	cache.Set("string:3", "three", 60)
+	cache.Set("int:1", 1, 60)
+	cache.Set("int:2", 2, 60)
+	cache.Set("bool:1", true, 60)
+
+	stats := cache.Stats()
+	want := []TypeCount{
+		{Type: reflect.TypeOf(""), Count: 3},
+		{Type: reflect.TypeOf(0), Count: 2},
+		{Type: reflect.TypeOf(false), Count: 1},
+	}
+	if !reflect.DeepEqual(stats.ByType, want) {
+		t.Fatalf("Stats.ByType = %#v, want %#v", stats.ByType, want)
+	}
+
+	stats.ByType[0].Count = 99
+	if count := cache.Stats().Count(reflect.TypeOf("")); count != 3 {
+		t.Fatalf("mutating ordered snapshot changed cache count to %d", count)
+	}
+	if got := (Stats{}).ByType; len(got) != 0 {
+		t.Fatalf("zero-value Stats contains %d type counts, want 0", len(got))
+	}
+}
+
+func TestStatsToJSON(t *testing.T) {
+	stats := Stats{
+		Total: 4,
+		ByType: []TypeCount{
+			{Type: reflect.TypeOf(""), Count: 3},
+			{Type: nil, Count: 1},
+		},
+	}
+
+	encoded, err := stats.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON returned error: %v", err)
+	}
+	want := `{"total":4,"byType":[{"type":"string","count":3},{"type":null,"count":1}]}`
+	if got := string(encoded); got != want {
+		t.Fatalf("ToJSON = %s, want %s", got, want)
+	}
+
+	encoded, err = (Stats{}).ToJSON()
+	if err != nil {
+		t.Fatalf("zero-value ToJSON returned error: %v", err)
+	}
+	if got, want := string(encoded), `{"total":0,"byType":[]}`; got != want {
+		t.Fatalf("zero-value ToJSON = %s, want %s", got, want)
+	}
 }
 
 func TestTouchMovesBucketAndHonorsExpiration(t *testing.T) {
@@ -487,7 +553,7 @@ func TestClearResetsStateAndRemainsReusable(t *testing.T) {
 	if more := cache.state.cleanExpiredBatch(cache.state.cleanedMinute); more {
 		t.Fatal("cleanup reported work at the reset cursor")
 	}
-	if _, _, found := cache.Get("new"); !found {
+	if _, found := cache.Get("new"); !found {
 		t.Fatal("cache was not reusable after Clear")
 	}
 }
@@ -565,10 +631,10 @@ func TestHeavyConcurrentSetPressure(t *testing.T) {
 	if stats.Total != wantTotal {
 		t.Fatalf("Stats.Total = %d, want %d", stats.Total, wantTotal)
 	}
-	if got := stats.ByType[reflect.TypeOf("")]; got != wantStrings {
+	if got := stats.Count(reflect.TypeOf("")); got != wantStrings {
 		t.Fatalf("string count = %d, want %d", got, wantStrings)
 	}
-	if got := stats.ByType[reflect.TypeOf(0)]; got != wantIntegers {
+	if got := stats.Count(reflect.TypeOf(0)); got != wantIntegers {
 		t.Fatalf("integer count = %d, want %d", got, wantIntegers)
 	}
 	if len(stats.ByType) != 2 {
@@ -578,11 +644,11 @@ func TestHeavyConcurrentSetPressure(t *testing.T) {
 	for worker := 0; worker < writerCount; worker++ {
 		prefix := strconv.Itoa(worker) + ":"
 		evenKey := prefix + "0"
-		if value, _, found := cache.Get(evenKey); !found || value != evenKey {
+		if value, found := cache.Get(evenKey); !found || value != evenKey {
 			t.Fatalf("Get(%q) = (%v, %v), want (%q, true)", evenKey, value, found, evenKey)
 		}
 		oddKey := prefix + "1"
-		if value, _, found := cache.Get(oddKey); !found || value != 1 {
+		if value, found := cache.Get(oddKey); !found || value != 1 {
 			t.Fatalf("Get(%q) = (%v, %v), want (1, true)", oddKey, value, found)
 		}
 	}
@@ -642,7 +708,7 @@ func TestWorkerCleanupUnderForegroundPressure(t *testing.T) {
 				if !cache.Touch(key, liveTTLSeconds) {
 					operationFailed.Store(true)
 				}
-				value, _, found := cache.Get(key)
+				value, found := cache.Get(key)
 				if !found || value != iteration {
 					operationFailed.Store(true)
 				}
@@ -691,7 +757,7 @@ func TestWorkerCleanupUnderForegroundPressure(t *testing.T) {
 	if stats.Total != foregroundWorkerCount {
 		t.Fatalf("Stats.Total = %d, want %d", stats.Total, foregroundWorkerCount)
 	}
-	if got := stats.ByType[reflect.TypeOf(0)]; got != foregroundWorkerCount {
+	if got := stats.Count(reflect.TypeOf(0)); got != foregroundWorkerCount {
 		t.Fatalf("integer count = %d, want %d", got, foregroundWorkerCount)
 	}
 	if len(stats.ByType) != 1 {
@@ -699,7 +765,7 @@ func TestWorkerCleanupUnderForegroundPressure(t *testing.T) {
 	}
 	for worker := 0; worker < foregroundWorkerCount; worker++ {
 		key := "live:" + strconv.Itoa(worker)
-		if value, _, found := cache.Get(key); !found || value != worker {
+		if value, found := cache.Get(key); !found || value != worker {
 			t.Fatalf("Get(%q) = (%v, %v), want (%d, true)", key, value, found, worker)
 		}
 	}
@@ -754,7 +820,7 @@ func TestClearRacesWithWritesAndCleanup(t *testing.T) {
 	cache.Clear()
 	cache.Set("after-clear", "value", 60)
 	assertIndexInvariant(t, cache)
-	if _, _, found := cache.Get("after-clear"); !found {
+	if _, found := cache.Get("after-clear"); !found {
 		t.Fatal("entry inserted after concurrent Clear was lost")
 	}
 }
@@ -809,12 +875,13 @@ func TestRandomizedOperationsMatchModel(t *testing.T) {
 		case 3:
 			record, exists := model[key]
 			wantFound := exists && record.expiresAtUnix > nowUnix
-			value, expiresAtUnix, found := cache.Get(key)
+			value, expiresAtUnix, remainingTTLSeconds, found := cache.GetWithTTL(key)
 			if found != wantFound {
 				t.Fatalf("step %d: Get(%q) found = %v, want %v", step, key, found, wantFound)
 			}
-			if wantFound && (value != record.value || expiresAtUnix != record.expiresAtUnix) {
-				t.Fatalf("step %d: Get(%q) = (%v, %d), want (%d, %d)", step, key, value, expiresAtUnix, record.value, record.expiresAtUnix)
+			wantRemainingTTLSeconds := record.expiresAtUnix - nowUnix - 1
+			if wantFound && (value != record.value || expiresAtUnix != record.expiresAtUnix || remainingTTLSeconds != wantRemainingTTLSeconds) {
+				t.Fatalf("step %d: GetWithTTL(%q) = (%v, %d, %d), want (%d, %d, %d)", step, key, value, expiresAtUnix, remainingTTLSeconds, record.value, record.expiresAtUnix, wantRemainingTTLSeconds)
 			}
 		case 4:
 			safeMinute := unixMinute(nowUnix) - cleanupGraceMinutes
@@ -936,7 +1003,7 @@ func TestWorkerStops(t *testing.T) {
 func TestNewCache(t *testing.T) {
 	cache := New(DefaultConfig())
 	cache.Set("key", "value", 60)
-	if value, _, found := cache.Get("key"); !found || value != "value" {
+	if value, found := cache.Get("key"); !found || value != "value" {
 		t.Fatalf("New cache Get = (%v, %v), want (value, true)", value, found)
 	}
 
@@ -948,25 +1015,40 @@ func TestNewCache(t *testing.T) {
 	}
 }
 
-func TestAutomaticCleanupStopsUnreachableWorker(t *testing.T) {
-	workerDone := newUnreachableCacheWorker()
+func TestAutomaticCleanupReclaimsUnreachableCacheAndWorker(t *testing.T) {
+	cacheReference, stateReference, workerDone := newUnreachableCacheWorker()
 	deadline := time.Now().Add(5 * time.Second)
+	cacheCollected := false
+	workerStopped := false
 
 	for {
 		runtime.GC()
-		select {
-		case <-workerDone:
+		if !cacheCollected {
+			cacheCollected = cacheReference.Value() == nil
+		}
+		if !workerStopped {
+			select {
+			case <-workerDone:
+				workerStopped = true
+			default:
+			}
+		}
+		if cacheCollected && workerStopped && stateReference.Value() == nil {
 			return
-		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("runtime cleanup did not stop the unreachable cache worker")
+			t.Fatalf(
+				"unreachable cache lifecycle incomplete: cache collected=%v, worker stopped=%v, state collected=%v",
+				cacheCollected,
+				workerStopped,
+				stateReference.Value() == nil,
+			)
 		}
 		runtime.Gosched()
 	}
 }
 
-func newUnreachableCacheWorker() <-chan struct{} {
+func newUnreachableCacheWorker() (weak.Pointer[Cache], weak.Pointer[cacheState], <-chan struct{}) {
 	cache := New(DefaultConfig())
-	return cache.state.workerDone
+	return weak.Make(cache), weak.Make(cache.state), cache.state.workerDone
 }
