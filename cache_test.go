@@ -50,9 +50,6 @@ func assertIndexInvariant(t *testing.T, cache *Cache) {
 
 	bucketRecords := 0
 	for minute, bucket := range state.minuteBuckets {
-		if bucket.minute != minute {
-			t.Fatalf("bucket key %d contains minute %d", minute, bucket.minute)
-		}
 		if len(bucket.entries) == 0 {
 			t.Fatalf("empty bucket retained for minute %d", minute)
 		}
@@ -478,7 +475,7 @@ func TestCleanupIgnoresStaleBucketRecord(t *testing.T) {
 	current := cache.state.entries["key"]
 
 	stale := &entry{value: "stale", typ: reflect.TypeOf(""), expiresAtUnix: 601}
-	staleBucket := &minuteBucket{minute: 10, entries: map[string]*entry{"key": stale}}
+	staleBucket := &minuteBucket{entries: map[string]*entry{"key": stale}}
 	cache.state.minuteBuckets[10] = staleBucket
 	cache.state.cleanedMinute = 9
 

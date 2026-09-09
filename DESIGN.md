@@ -154,7 +154,6 @@ type entry struct {
 }
 
 type minuteBucket struct {
-	minute  int64
 	entries map[string]*entry
 }
 

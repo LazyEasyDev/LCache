@@ -92,7 +92,6 @@ type entry struct {
 }
 
 type minuteBucket struct {
-	minute  int64
 	entries map[string]*entry
 }
 
@@ -334,10 +333,7 @@ func (state *cacheState) addBucketRecord(key string, record *entry) {
 	}
 	bucket := state.minuteBuckets[minute]
 	if bucket == nil {
-		bucket = &minuteBucket{
-			minute:  minute,
-			entries: make(map[string]*entry),
-		}
+		bucket = &minuteBucket{entries: make(map[string]*entry)}
 		state.minuteBuckets[minute] = bucket
 	}
 	bucket.entries[key] = record
