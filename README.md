@@ -199,6 +199,12 @@ Pointers, maps, slices, and other reference-bearing values still refer to
 caller-visible data. The caller is responsible for synchronizing concurrent
 access to mutable cached values.
 
+Do not store the owning `*Cache` as a value, either directly or through a
+struct, map, closure, or other reference chain. Such a back-reference keeps
+the cache wrapper reachable from its worker state and delays automatic worker
+shutdown until the entry is physically removed. LCache does not attempt to
+detect indirect references.
+
 Empty strings are valid keys. Methods must be called on a non-nil cache
 returned by `New`.
 

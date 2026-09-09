@@ -103,6 +103,8 @@ including logically expired records awaiting cleanup.
 - Values are stored directly and are not cloned.
 - Callers own synchronization for mutable pointers, maps, slices, and other
   reference-bearing values.
+- A stored value must not reference its owning `*Cache`, directly or
+	indirectly. LCache does not inspect object graphs to enforce this rule.
 - Calling a method on a nil `*Cache` is a programming error and may panic.
 
 ### Copying
@@ -228,7 +230,9 @@ TTL.
 
 Expiration follows the system wall clock. A backward adjustment can extend or
 revive a physically resident entry. The design does not provide monotonic TTL
-semantics.
+semantics. Clock readings before the Unix epoch are normalized to Unix second
+zero because negative wall-clock time is outside the cache's supported runtime
+domain.
 
 ## Mutation Transactions
 
@@ -373,6 +377,12 @@ When the wrapper becomes unreachable, `runtime.AddCleanup` may invoke
 `stopWorker(state)`. `stopOnce` closes the stop channel at most once, the
 worker exits, and the remaining state becomes reclaimable. Runtime cleanup is
 eventual and is not guaranteed to run before process exit.
+
+A cached value that points back to its owning `*Cache`, including through a
+nested object or closure, creates a path from the worker state back to the
+wrapper. That path keeps the wrapper reachable and delays its runtime cleanup
+until expiration cleanup, `Delete`, or `Clear` removes the value. Callers must
+therefore not store the owning cache in its own value graph.
 
 Every public method copies `c.state` locally and defers `runtime.KeepAlive(c)`.
 This prevents runtime cleanup from stopping maintenance while a method is

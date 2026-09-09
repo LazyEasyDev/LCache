@@ -84,6 +84,10 @@ func newCacheState(config Config, clock func() int64) *cacheState {
 		maxTTLSeconds = DefaultMaxTTLSeconds
 	}
 
+	sourceClock := clock
+	clock = func() int64 {
+		return max(sourceClock(), 0)
+	}
 	nowUnix := clock()
 	state := &cacheState{
 		entries:       make(map[string]*entry),

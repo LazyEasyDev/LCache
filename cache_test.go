@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"reflect"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -104,6 +105,30 @@ func TestDefaultConfigAndNormalization(t *testing.T) {
 				t.Fatalf("normalized max TTL = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestNegativeClockIsClampedToUnixEpoch(t *testing.T) {
+	cache, clock := newTestCache(-100, DefaultConfig())
+	if got := cache.state.cachedNowUnix.Load(); got != 0 {
+		t.Fatalf("initial cached Unix time = %d, want 0", got)
+	}
+	if got := cache.state.cleanedMinute; got != -cleanupGraceMinutes {
+		t.Fatalf("initial cleaned minute = %d, want %d", got, -cleanupGraceMinutes)
+	}
+
+	cache.Set("key", "value", 1)
+	if _, expiresAtUnix, found := cache.Get("key"); !found || expiresAtUnix != 2 {
+		t.Fatalf("Get after negative clock Set = (_, %d, %v), want (_, 2, true)", expiresAtUnix, found)
+	}
+
+	clock.Set(-1)
+	if got := cache.state.clock(); got != 0 {
+		t.Fatalf("negative clock reading = %d, want 0", got)
+	}
+	clock.Set(60)
+	if got := cache.state.clock(); got != 60 {
+		t.Fatalf("positive clock reading = %d, want 60", got)
 	}
 }
 
@@ -487,6 +512,82 @@ func TestConcurrentOperationsPreserveIndex(t *testing.T) {
 	}
 	waitGroup.Wait()
 	assertIndexInvariant(t, cache)
+}
+
+func TestHeavyConcurrentSetPressure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy concurrent write test in short mode")
+	}
+
+	const (
+		writerCount     = 32
+		writesPerWriter = 10_000
+	)
+
+	cache := New(DefaultConfig())
+	t.Cleanup(func() {
+		stopWorker(cache.state)
+		select {
+		case <-cache.state.workerDone:
+		case <-time.After(time.Second):
+			t.Fatal("worker did not stop after heavy write test")
+		}
+	})
+
+	start := make(chan struct{})
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(writerCount)
+	startedAt := time.Now()
+
+	for worker := 0; worker < writerCount; worker++ {
+		prefix := strconv.Itoa(worker) + ":"
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			for iteration := 0; iteration < writesPerWriter; iteration++ {
+				key := prefix + strconv.Itoa(iteration)
+				cache.Set(key, iteration, DefaultMaxTTLSeconds)
+				if iteration%2 == 0 {
+					cache.Set(key, key, DefaultMaxTTLSeconds)
+				}
+			}
+		}()
+	}
+
+	close(start)
+	waitGroup.Wait()
+
+	wantTotal := writerCount * writesPerWriter
+	wantStrings := writerCount * (writesPerWriter / 2)
+	wantIntegers := wantTotal - wantStrings
+	stats := cache.Stats()
+	if stats.Total != wantTotal {
+		t.Fatalf("Stats.Total = %d, want %d", stats.Total, wantTotal)
+	}
+	if got := stats.ByType[reflect.TypeOf("")]; got != wantStrings {
+		t.Fatalf("string count = %d, want %d", got, wantStrings)
+	}
+	if got := stats.ByType[reflect.TypeOf(0)]; got != wantIntegers {
+		t.Fatalf("integer count = %d, want %d", got, wantIntegers)
+	}
+	if len(stats.ByType) != 2 {
+		t.Fatalf("type count entries = %d, want 2", len(stats.ByType))
+	}
+
+	for worker := 0; worker < writerCount; worker++ {
+		prefix := strconv.Itoa(worker) + ":"
+		evenKey := prefix + "0"
+		if value, _, found := cache.Get(evenKey); !found || value != evenKey {
+			t.Fatalf("Get(%q) = (%v, %v), want (%q, true)", evenKey, value, found, evenKey)
+		}
+		oddKey := prefix + "1"
+		if value, _, found := cache.Get(oddKey); !found || value != 1 {
+			t.Fatalf("Get(%q) = (%v, %v), want (1, true)", oddKey, value, found)
+		}
+	}
+
+	assertIndexInvariant(t, cache)
+	t.Logf("completed %d concurrent Set calls in %s", wantTotal+wantStrings, time.Since(startedAt))
 }
 
 func TestClearRacesWithWritesAndCleanup(t *testing.T) {
