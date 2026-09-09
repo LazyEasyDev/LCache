@@ -95,6 +95,7 @@ func TestDefaultConfigAndNormalization(t *testing.T) {
 		{name: "zero", in: 0, want: DefaultMaxTTLSeconds},
 		{name: "negative", in: -1, want: DefaultMaxTTLSeconds},
 		{name: "above default", in: DefaultMaxTTLSeconds + 1, want: DefaultMaxTTLSeconds},
+		{name: "lower bound", in: minimumTTLSeconds, want: minimumTTLSeconds},
 		{name: "valid", in: 10, want: 10},
 	}
 
@@ -588,6 +589,127 @@ func TestHeavyConcurrentSetPressure(t *testing.T) {
 
 	assertIndexInvariant(t, cache)
 	t.Logf("completed %d concurrent Set calls in %s", wantTotal+wantStrings, time.Since(startedAt))
+}
+
+func TestWorkerCleanupUnderForegroundPressure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping cleanup pressure test in short mode")
+	}
+
+	const (
+		foregroundWorkerCount = 8
+		operationsPerWorker   = 2_000
+		liveTTLSeconds        = int64(60 * 60)
+		cleanupNowUnix        = int64(660)
+	)
+	expiredEntryCount := workerBatchSize*8 + 17
+
+	cache, clock := newTestCache(600, DefaultConfig())
+	for index := 0; index < expiredEntryCount; index++ {
+		cache.Set("expired:"+strconv.Itoa(index), index, 1)
+	}
+	dueMinute := unixMinute(cache.state.entries["expired:0"].expiresAtUnix)
+
+	ticks := make(chan time.Time)
+	go cache.state.runWorkerWithTicks(ticks)
+	t.Cleanup(func() {
+		stopWorker(cache.state)
+		select {
+		case <-cache.state.workerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not stop after cleanup pressure test")
+		}
+	})
+
+	clock.Set(cleanupNowUnix)
+	start := make(chan struct{})
+	var waitGroup sync.WaitGroup
+	var operationFailed atomic.Bool
+	var operationsDuringCleanup atomic.Int64
+	waitGroup.Add(foregroundWorkerCount)
+
+	for worker := 0; worker < foregroundWorkerCount; worker++ {
+		key := "live:" + strconv.Itoa(worker)
+		go func(worker int, key string) {
+			defer waitGroup.Done()
+			<-start
+			for cache.state.cachedNowUnix.Load() != cleanupNowUnix {
+				runtime.Gosched()
+			}
+
+			for iteration := 0; iteration < operationsPerWorker; iteration++ {
+				cache.Set(key, iteration, liveTTLSeconds)
+				if !cache.Touch(key, liveTTLSeconds) {
+					operationFailed.Store(true)
+				}
+				value, _, found := cache.Get(key)
+				if !found || value != iteration {
+					operationFailed.Store(true)
+				}
+				if iteration%11 == 0 && !cache.Delete(key) {
+					operationFailed.Store(true)
+				}
+
+				cache.state.mu.RLock()
+				cleanupPending := cache.state.minuteBuckets[dueMinute] != nil
+				cache.state.mu.RUnlock()
+				if cleanupPending {
+					operationsDuringCleanup.Add(1)
+				}
+			}
+			cache.Set(key, worker, liveTTLSeconds)
+		}(worker, key)
+	}
+
+	startedAt := time.Now()
+	close(start)
+	ticks <- time.Time{}
+	waitGroup.Wait()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		cache.state.mu.RLock()
+		cleanupPending := cache.state.minuteBuckets[dueMinute] != nil
+		cache.state.mu.RUnlock()
+		if !cleanupPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not drain the expired bucket")
+		}
+		runtime.Gosched()
+	}
+
+	if operationFailed.Load() {
+		t.Fatal("foreground operation failed while cleanup was active")
+	}
+	if got := operationsDuringCleanup.Load(); got == 0 {
+		t.Fatal("foreground operations did not overlap pending cleanup")
+	}
+
+	stats := cache.Stats()
+	if stats.Total != foregroundWorkerCount {
+		t.Fatalf("Stats.Total = %d, want %d", stats.Total, foregroundWorkerCount)
+	}
+	if got := stats.ByType[reflect.TypeOf(0)]; got != foregroundWorkerCount {
+		t.Fatalf("integer count = %d, want %d", got, foregroundWorkerCount)
+	}
+	if len(stats.ByType) != 1 {
+		t.Fatalf("type count entries = %d, want 1", len(stats.ByType))
+	}
+	for worker := 0; worker < foregroundWorkerCount; worker++ {
+		key := "live:" + strconv.Itoa(worker)
+		if value, _, found := cache.Get(key); !found || value != worker {
+			t.Fatalf("Get(%q) = (%v, %v), want (%d, true)", key, value, found, worker)
+		}
+	}
+	assertIndexInvariant(t, cache)
+	t.Logf(
+		"cleaned %d expired entries while %d foreground operations overlapped in %s",
+		expiredEntryCount,
+		operationsDuringCleanup.Load(),
+		time.Since(startedAt),
+	)
 }
 
 func TestClearRacesWithWritesAndCleanup(t *testing.T) {

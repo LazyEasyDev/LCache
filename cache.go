@@ -1,3 +1,4 @@
+// Package cache provides a concurrent, in-process cache with per-entry TTLs.
 package cache
 
 import (
@@ -9,25 +10,36 @@ import (
 	"time"
 )
 
+// DefaultMaxTTLSeconds is the default upper bound for entry TTLs: 24 hours.
 const DefaultMaxTTLSeconds int64 = 24 * 60 * 60
 
 const (
 	clockUpdateInterval = time.Second
 	workerBatchSize     = 4 * 1024
 	cleanupGraceMinutes = int64(1)
+	minimumTTLSeconds   = int64(1)
 	secondsPerMinute    = int64(60)
 )
 
+// Config controls Cache behavior.
 type Config struct {
+	// MaxTTLSeconds is the largest TTL accepted by Set and Touch. Values outside
+	// the range 1 through DefaultMaxTTLSeconds use DefaultMaxTTLSeconds.
 	MaxTTLSeconds int64
 }
 
+// DefaultConfig returns a Config with the default 24-hour maximum TTL.
 func DefaultConfig() Config {
 	return Config{MaxTTLSeconds: DefaultMaxTTLSeconds}
 }
 
+// Stats is a snapshot of physically resident cache entries.
 type Stats struct {
-	Total  int
+	// Total is the number of physically resident entries, including expired
+	// entries that have not yet been removed by background cleanup.
+	Total int
+	// ByType maps each stored value's dynamic type to its resident entry count.
+	// A bare nil value is counted under a nil reflect.Type key.
 	ByType map[reflect.Type]int
 }
 
@@ -63,11 +75,14 @@ type noCopy struct{}
 func (*noCopy) Lock()   {}
 func (*noCopy) Unlock() {}
 
+// Cache is a concurrent, in-process cache for values of any type.
+// A Cache must not be copied after New returns; share it through a *Cache.
 type Cache struct {
 	noCopy noCopy
 	state  *cacheState
 }
 
+// New creates a Cache and starts its background expiration worker.
 func New(config Config) *Cache {
 	state := newCacheState(config, func() int64 { return time.Now().Unix() })
 	cache := &Cache{state: state}
@@ -80,7 +95,7 @@ func New(config Config) *Cache {
 
 func newCacheState(config Config, clock func() int64) *cacheState {
 	maxTTLSeconds := config.MaxTTLSeconds
-	if maxTTLSeconds < 1 || maxTTLSeconds > DefaultMaxTTLSeconds {
+	if maxTTLSeconds < minimumTTLSeconds || maxTTLSeconds > DefaultMaxTTLSeconds {
 		maxTTLSeconds = DefaultMaxTTLSeconds
 	}
 
@@ -109,6 +124,8 @@ func stopWorker(state *cacheState) {
 	})
 }
 
+// Set stores value under key for ttlSeconds. A non-positive TTL is a no-op,
+// and a TTL above the configured maximum is clamped. Set accepts nil values.
 func (c *Cache) Set(key string, value any, ttlSeconds int64) {
 	state := c.state
 	defer runtime.KeepAlive(c)
@@ -139,6 +156,8 @@ func (c *Cache) Set(key string, value any, ttlSeconds int64) {
 	state.typeCounts[record.typ]++
 }
 
+// Get returns a live value and its absolute Unix-second expiration deadline.
+// It returns nil, 0, false when key is absent or expired.
 func (c *Cache) Get(key string) (value any, expiresAtUnix int64, found bool) {
 	state := c.state
 	defer runtime.KeepAlive(c)
@@ -154,6 +173,9 @@ func (c *Cache) Get(key string) (value any, expiresAtUnix int64, found bool) {
 	return value, expiresAtUnix, true
 }
 
+// Touch changes the TTL of a live entry and reports whether one exists. A TTL
+// above the configured maximum is clamped. For a live entry, a non-positive
+// TTL leaves the deadline unchanged and returns true.
 func (c *Cache) Touch(key string, ttlSeconds int64) bool {
 	state := c.state
 	defer runtime.KeepAlive(c)
@@ -183,6 +205,8 @@ func (c *Cache) Touch(key string, ttlSeconds int64) bool {
 	return true
 }
 
+// Delete physically removes key and reports whether its entry was live. An
+// expired entry may be removed while Delete returns false.
 func (c *Cache) Delete(key string) bool {
 	state := c.state
 	defer runtime.KeepAlive(c)
@@ -202,6 +226,8 @@ func (c *Cache) Delete(key string) bool {
 	return live
 }
 
+// Clear atomically removes all entries and resets statistics. The Cache remains
+// usable and its background worker continues running.
 func (c *Cache) Clear() {
 	state := c.state
 	defer runtime.KeepAlive(c)
@@ -214,6 +240,7 @@ func (c *Cache) Clear() {
 	state.mu.Unlock()
 }
 
+// Stats returns an independent snapshot of physically resident entry counts.
 func (c *Cache) Stats() Stats {
 	state := c.state
 	defer runtime.KeepAlive(c)
