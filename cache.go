@@ -87,18 +87,13 @@ func (s Stats) ToJSON() ([]byte, error) {
 
 type entry struct {
 	value         any
-	typ           reflect.Type
 	expiresAtUnix int64
-}
-
-type minuteBucket struct {
-	entries map[string]*entry
 }
 
 type cacheState struct {
 	mu            sync.RWMutex
 	entries       map[string]*entry
-	minuteBuckets map[int64]*minuteBucket
+	minuteBuckets map[int64]map[string]*entry
 	cleanedMinute int64
 	typeCounts    map[reflect.Type]int
 
@@ -147,7 +142,7 @@ func newCacheState(config Config, clock func() int64) *cacheState {
 	nowUnix := clock()
 	state := &cacheState{
 		entries:       make(map[string]*entry),
-		minuteBuckets: make(map[int64]*minuteBucket),
+		minuteBuckets: make(map[int64]map[string]*entry),
 		cleanedMinute: unixMinute(nowUnix) - cleanupGraceMinutes,
 		typeCounts:    make(map[reflect.Type]int),
 		clock:         clock,
@@ -183,18 +178,19 @@ func (c *Cache) Set(key string, value any, ttlSeconds int64) {
 
 	record := &entry{
 		value:         value,
-		typ:           reflect.TypeOf(value),
 		expiresAtUnix: expirationDeadline(state.clock(), ttlSeconds),
 	}
 
 	if previous, found := state.entries[key]; found {
-		state.removeBucketRecord(key, previous)
-		state.decrementType(previous.typ)
+		if unixMinute(previous.expiresAtUnix) != unixMinute(record.expiresAtUnix) {
+			state.removeBucketRecord(key, previous)
+		}
+		state.decrementType(reflect.TypeOf(previous.value))
 	}
 
 	state.entries[key] = record
 	state.addBucketRecord(key, record)
-	state.typeCounts[record.typ]++
+	state.typeCounts[reflect.TypeOf(record.value)]++
 }
 
 // Get returns the live value stored under key. It returns nil, false when key
@@ -262,10 +258,11 @@ func (c *Cache) Touch(key string, ttlSeconds int64) bool {
 
 	record := &entry{
 		value:         previous.value,
-		typ:           previous.typ,
 		expiresAtUnix: expirationDeadline(state.clock(), ttlSeconds),
 	}
-	state.removeBucketRecord(key, previous)
+	if unixMinute(previous.expiresAtUnix) != unixMinute(record.expiresAtUnix) {
+		state.removeBucketRecord(key, previous)
+	}
 	state.entries[key] = record
 	state.addBucketRecord(key, record)
 	return true
@@ -288,7 +285,7 @@ func (c *Cache) Delete(key string) bool {
 	live := record.expiresAtUnix > state.cachedNowUnix.Load()
 	delete(state.entries, key)
 	state.removeBucketRecord(key, record)
-	state.decrementType(record.typ)
+	state.decrementType(reflect.TypeOf(record.value))
 	return live
 }
 
@@ -300,7 +297,7 @@ func (c *Cache) Clear() {
 
 	state.mu.Lock()
 	state.entries = make(map[string]*entry)
-	state.minuteBuckets = make(map[int64]*minuteBucket)
+	state.minuteBuckets = make(map[int64]map[string]*entry)
 	state.typeCounts = make(map[reflect.Type]int)
 	state.cleanedMinute = unixMinute(state.clock()) - cleanupGraceMinutes
 	state.mu.Unlock()
@@ -333,21 +330,21 @@ func (state *cacheState) addBucketRecord(key string, record *entry) {
 	}
 	bucket := state.minuteBuckets[minute]
 	if bucket == nil {
-		bucket = &minuteBucket{entries: make(map[string]*entry)}
+		bucket = make(map[string]*entry)
 		state.minuteBuckets[minute] = bucket
 	}
-	bucket.entries[key] = record
+	bucket[key] = record
 }
 
 func (state *cacheState) removeBucketRecord(key string, record *entry) {
 	minute := unixMinute(record.expiresAtUnix)
 	bucket := state.minuteBuckets[minute]
-	if bucket == nil || bucket.entries[key] != record {
+	if bucket[key] != record {
 		return
 	}
 
-	delete(bucket.entries, key)
-	if len(bucket.entries) == 0 && state.minuteBuckets[minute] == bucket {
+	delete(bucket, key)
+	if len(bucket) == 0 {
 		delete(state.minuteBuckets, minute)
 	}
 }
@@ -378,23 +375,21 @@ func (state *cacheState) cleanExpiredBatch(safeMinute int64) bool {
 			continue
 		}
 
-		for key, record := range bucket.entries {
+		for key, record := range bucket {
 			if work >= workerBatchSize {
 				return true
 			}
 
-			delete(bucket.entries, key)
+			delete(bucket, key)
 			work++
 			if state.entries[key] == record {
 				delete(state.entries, key)
-				state.decrementType(record.typ)
+				state.decrementType(reflect.TypeOf(record.value))
 			}
 		}
 
-		if len(bucket.entries) == 0 {
-			if state.minuteBuckets[minute] == bucket {
-				delete(state.minuteBuckets, minute)
-			}
+		if len(bucket) == 0 {
+			delete(state.minuteBuckets, minute)
 			state.cleanedMinute = minute
 		}
 		if work >= workerBatchSize {

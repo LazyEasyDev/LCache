@@ -50,10 +50,10 @@ func assertIndexInvariant(t *testing.T, cache *Cache) {
 
 	bucketRecords := 0
 	for minute, bucket := range state.minuteBuckets {
-		if len(bucket.entries) == 0 {
+		if len(bucket) == 0 {
 			t.Fatalf("empty bucket retained for minute %d", minute)
 		}
-		for key, record := range bucket.entries {
+		for key, record := range bucket {
 			bucketRecords++
 			if unixMinute(record.expiresAtUnix) != minute {
 				t.Fatalf("key %q has deadline minute %d in bucket %d", key, unixMinute(record.expiresAtUnix), minute)
@@ -70,10 +70,10 @@ func assertIndexInvariant(t *testing.T, cache *Cache) {
 	wantTypeCounts := make(map[reflect.Type]int)
 	for key, record := range state.entries {
 		bucket := state.minuteBuckets[unixMinute(record.expiresAtUnix)]
-		if bucket == nil || bucket.entries[key] != record {
+		if bucket[key] != record {
 			t.Fatalf("authoritative record for %q is not indexed", key)
 		}
-		wantTypeCounts[record.typ]++
+		wantTypeCounts[reflect.TypeOf(record.value)]++
 	}
 	if !reflect.DeepEqual(state.typeCounts, wantTypeCounts) {
 		t.Fatalf("type counts = %#v, want %#v", state.typeCounts, wantTypeCounts)
@@ -355,7 +355,7 @@ func TestSetReplacementMovesBucket(t *testing.T) {
 	if cache.state.minuteBuckets[firstMinute] != nil {
 		t.Fatal("old bucket remained after replacement")
 	}
-	if cache.state.minuteBuckets[secondMinute].entries["key"] != second {
+	if cache.state.minuteBuckets[secondMinute]["key"] != second {
 		t.Fatal("replacement was not inserted into its new bucket")
 	}
 	assertIndexInvariant(t, cache)
@@ -368,21 +368,72 @@ func TestSameMinuteReplacementAndDeletePreserveBucket(t *testing.T) {
 
 	minute := unixMinute(cache.state.entries["first"].expiresAtUnix)
 	bucket := cache.state.minuteBuckets[minute]
-	if bucket == nil || len(bucket.entries) != 2 {
-		t.Fatalf("same-minute bucket contains %d entries, want 2", len(bucket.entries))
+	if len(bucket) != 2 {
+		t.Fatalf("same-minute bucket contains %d entries, want 2", len(bucket))
 	}
 
 	cache.Set("first", "updated", 5)
-	if cache.state.minuteBuckets[minute] != bucket || len(bucket.entries) != 2 {
+	if bucket["first"] != cache.state.entries["first"] || len(bucket) != 2 {
 		t.Fatal("same-minute replacement recreated or damaged the shared bucket")
 	}
-	if !cache.Delete("first") || len(bucket.entries) != 1 || bucket.entries["second"] == nil {
+	if !cache.Delete("first") || len(bucket) != 1 || bucket["second"] == nil {
 		t.Fatal("deleting one key damaged another key in the same bucket")
 	}
 	if !cache.Delete("second") || cache.state.minuteBuckets[minute] != nil {
 		t.Fatal("last deletion did not remove the empty minute bucket")
 	}
 	assertIndexInvariant(t, cache)
+}
+
+func TestSameMinuteUpdatesReuseSingleEntryBucket(test *testing.T) {
+	for _, operation := range []string{"Set", "Touch"} {
+		test.Run(operation, func(test *testing.T) {
+			cache, _ := newTestCache(600, DefaultConfig())
+			cache.Set("key", "original", 1)
+			previous := cache.state.entries["key"]
+			bucket := cache.state.minuteBuckets[unixMinute(previous.expiresAtUnix)]
+
+			var wantValue any = "original"
+			if operation == "Set" {
+				wantValue = 42
+				cache.Set("key", wantValue, 20)
+			} else if !cache.Touch("key", 20) {
+				test.Fatal("Touch returned false for a live entry")
+			}
+
+			updated := cache.state.entries["key"]
+			if updated == previous {
+				test.Fatal("update did not create a new entry")
+			}
+			if len(bucket) != 1 || bucket["key"] != updated {
+				test.Fatal("same-minute update replaced the single-entry bucket")
+			}
+			value, expiresAtUnix, remainingTTLSeconds, found := cache.GetWithTTL("key")
+			if !found || value != wantValue || expiresAtUnix != 621 || remainingTTLSeconds != 20 {
+				test.Fatalf("GetWithTTL = (%v, %d, %d, %v), want (%v, 621, 20, true)", value, expiresAtUnix, remainingTTLSeconds, found, wantValue)
+			}
+			assertIndexInvariant(test, cache)
+		})
+	}
+}
+
+func BenchmarkSameMinuteUpdates(benchmark *testing.B) {
+	benchmark.Run("Set", func(benchmark *testing.B) {
+		cache, _ := newTestCache(600, DefaultConfig())
+		cache.Set("key", 42, 20)
+		benchmark.ReportAllocs()
+		for benchmark.Loop() {
+			cache.Set("key", 42, 20)
+		}
+	})
+	benchmark.Run("Touch", func(benchmark *testing.B) {
+		cache, _ := newTestCache(600, DefaultConfig())
+		cache.Set("key", 42, 20)
+		benchmark.ReportAllocs()
+		for benchmark.Loop() {
+			cache.Touch("key", 20)
+		}
+	})
 }
 
 func TestCleanupGraceBoundary(t *testing.T) {
@@ -474,9 +525,8 @@ func TestCleanupIgnoresStaleBucketRecord(t *testing.T) {
 	cache.Set("key", "current", 700)
 	current := cache.state.entries["key"]
 
-	stale := &entry{value: "stale", typ: reflect.TypeOf(""), expiresAtUnix: 601}
-	staleBucket := &minuteBucket{entries: map[string]*entry{"key": stale}}
-	cache.state.minuteBuckets[10] = staleBucket
+	stale := &entry{value: "stale", expiresAtUnix: 601}
+	cache.state.minuteBuckets[10] = map[string]*entry{"key": stale}
 	cache.state.cleanedMinute = 9
 
 	if more := cache.state.cleanExpiredBatch(10); more {

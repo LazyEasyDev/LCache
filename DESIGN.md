@@ -149,18 +149,13 @@ The implementation centers on these structures:
 ```go
 type entry struct {
 	value         any
-	typ           reflect.Type
 	expiresAtUnix int64
-}
-
-type minuteBucket struct {
-	entries map[string]*entry
 }
 
 type cacheState struct {
 	mu            sync.RWMutex
 	entries       map[string]*entry
-	minuteBuckets map[int64]*minuteBucket
+	minuteBuckets map[int64]map[string]*entry
 	cleanedMinute int64
 	typeCounts    map[reflect.Type]int
 
@@ -190,9 +185,10 @@ expiration index, and `typeCounts` is derived accounting. All three are
 protected by `mu`.
 
 Every positive `Set` and successful positive `Touch` creates a new `entry`.
-The value, concrete type, and deadline metadata are not changed after the
-entry is published. Reference-bearing values may still point to mutable data;
-metadata immutability does not imply deep value immutability.
+The value and deadline metadata are not changed after the entry is published.
+Type accounting derives each entry's type from `reflect.TypeOf(entry.value)`
+instead of storing it separately. Reference-bearing values may still point to
+mutable data; metadata immutability does not imply deep value immutability.
 
 ### Invariants
 
@@ -203,8 +199,8 @@ At every public operation boundary while `mu` is held:
 2. The selected bucket key equals `entry.expiresAtUnix / 60`.
 3. Every bucket record points to the authoritative record for that key.
 4. `minuteBuckets` contains no empty bucket.
-5. `typeCounts[t]` equals the number of resident entries whose stored type is
-   `t`; zero counts are absent.
+5. `typeCounts[t]` equals the number of resident entries for which
+	`reflect.TypeOf(value) == t`; zero counts are absent.
 
 A bare nil value has `reflect.TypeOf(value) == nil` and is counted under the
 valid nil key in `map[reflect.Type]int`. A typed nil is counted under its
@@ -273,7 +269,8 @@ For a positive TTL, `Set`:
 1. Clamps the TTL to `maxTTLSeconds`.
 2. Acquires `mu` for writing.
 3. Samples the clock and creates a new immutable record.
-4. Removes any previous record from its minute bucket and type count.
+4. Removes any previous record's bucket placement only when its expiration
+	minute changes, and decrements the previous record's type count.
 5. Publishes the new record in `entries`, its due-minute bucket, and its type
    count.
 
@@ -288,8 +285,10 @@ record. A live record with a non-positive requested TTL returns `true` without
 mutation.
 
 For a live record and positive TTL, it creates a new record carrying the same
-value and type, removes the old bucket placement, replaces the authoritative
-pointer, and inserts the new bucket placement. Type counts do not change.
+value and removes the old bucket placement only when the expiration minute
+changes. It replaces the authoritative pointer and writes the new bucket
+placement, reusing the existing bucket for same-minute updates. Type counts do
+not change.
 
 ### Delete
 
@@ -309,7 +308,7 @@ cleanedMinute = currentUnixMinute - cleanupGraceMinutes
 ```
 
 The operation does not iterate over old records, call `runtime.GC`, stop the
-worker, or retain old bucket pointers after unlocking. Old structures become
+worker, or retain old bucket references after unlocking. Old structures become
 eligible for garbage collection when no concurrent operation references them.
 
 ## Minute-Bucket Index
@@ -322,9 +321,11 @@ dueMinute := expiresAtUnix / 60
 ```
 
 Buckets are sparse. The outer map and an inner key map allocate storage only
-for occupied minutes. An empty bucket is removed immediately after replacement
-or deletion. Absolute minute keys avoid circular-slot reuse, overflow buckets,
-and range remapping.
+for occupied minutes. Same-minute `Set` and `Touch` updates overwrite the
+existing bucket placement without deleting or recreating the bucket, even
+when it contains only one entry. An empty bucket is removed immediately after
+a cross-minute replacement or deletion. Absolute minute keys avoid
+circular-slot reuse, overflow buckets, and range remapping.
 
 The ordinary future horizon is bounded by the configured maximum TTL. The
 index can retain expired records during the cleanup grace period or a worker
@@ -394,7 +395,7 @@ The worker owns one one-second ticker. On a tick it:
    run.
 
 Each batch takes the write lock independently. The worker retains no entry or
-bucket pointer across an unlock, allowing `Clear` to replace all structures
+bucket reference across an unlock, allowing `Clear` to replace all structures
 safely.
 
 ### Automatic Shutdown
@@ -473,20 +474,27 @@ or coordinated invalidation need an additional policy or a different cache.
 The test suite uses an injected clock rather than long sleeps. It covers:
 
 - TTL normalization, clamping, boundary behavior, and integer saturation
-- bare nil and typed nil values
+- bare nil, typed nil, pointer, map, and slice values through full entry lifecycles
 - replacement, deletion, and movement between minute buckets
+- same-minute single-entry bucket reuse and allocation benchmarks
 - exact type counts and independent statistics snapshots
 - cleanup safety boundaries, partial batches, and empty-minute catch-up
-- stale bucket identity protection and backward-clock cursor recovery
+- stale-record identity protection and backward-clock cursor recovery
 - `Clear` reuse and races with mutation and cleanup
 - randomized operations checked against a reference model
+- model-based fuzzing with independently updated source and cached clocks
+- deadline arithmetic fuzzed against an unsigned-integer model
 - concurrent operations and expiration-index invariants
-- deterministic worker ticks, stop behavior, and automatic runtime cleanup
+- deterministic worker ticks, pending-cleanup clock refresh and shutdown,
+  concurrent stop requests, and automatic runtime cleanup
 
 Run the standard, race, and static-analysis checks with:
 
 ```sh
 go test ./...
 go test -race ./...
-go vet ./...
+go vet -all ./...
 ```
+
+See [README.md](README.md#verification) for stress, fuzz, coverage, and
+allocation-benchmark commands.
