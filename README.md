@@ -37,6 +37,7 @@ import (
 
 func main() {
 	local := cache.New(cache.DefaultConfig())
+	defer local.Close()
 
 	local.Set("user:42", "Alice", 60)
 
@@ -151,7 +152,29 @@ local.Clear()
 ```
 
 Atomically removes all entries and resets statistics. The cache remains
-usable, and its maintenance worker continues running.
+usable, and its maintenance worker continues running. After `Close`, `Clear`
+is a no-op and does not reopen the cache.
+
+### `Close`
+
+```go
+local.Close()
+```
+
+Permanently empties the cache, releases its references to stored values, and
+waits for the maintenance worker and its ticker to stop. It is safe to call
+repeatedly and concurrently with any other operation.
+
+After `Close`:
+
+- `Set` and `Clear` are no-ops.
+- `Get` returns `nil, false`.
+- `GetWithTTL` returns `nil, 0, 0, false`.
+- `Touch` and `Delete` return `false`.
+- `Stats` returns zero total entries and no type counts.
+
+A closed cache cannot be reopened; use `New` to create another one. Stored
+values remain caller-owned; `Close` does not call their own `Close` methods.
 
 ### `Stats`
 
@@ -263,9 +286,10 @@ alias := local
 Do not copy the `Cache` struct itself with `copied := *local`. The type carries
 a `noCopy` marker so `go vet` can report accidental copies.
 
-There is no manual `Close` method. When the `*Cache` wrapper becomes
-unreachable, a runtime cleanup signals the worker to stop. Cleanup timing is
-nondeterministic and is not guaranteed before process exit.
+Call `Close` when the cache is no longer needed for deterministic worker
+shutdown. When the `*Cache` wrapper becomes unreachable without an explicit
+`Close`, a runtime cleanup signals the worker to stop as a fallback. Cleanup
+timing is nondeterministic and is not guaranteed before process exit.
 
 ## Complexity
 
@@ -277,6 +301,7 @@ nondeterministic and is not guaranteed before process exit.
 | `Touch` | O(1) |
 | `Delete` | O(1) |
 | `Clear` | O(1) map replacement |
+| `Close` | O(1) map release, plus waiting for worker shutdown |
 | `Stats.Count` | O(t), where `t` is the number of represented value types |
 | `Stats.ToJSON` | O(t) |
 | `Stats` | O(t log t) to copy and order represented value types |

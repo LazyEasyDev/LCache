@@ -724,15 +724,7 @@ func TestWorkerCleanupUnderForegroundPressure(t *testing.T) {
 	dueMinute := unixMinute(cache.state.entries["expired:0"].expiresAtUnix)
 
 	ticks := make(chan time.Time)
-	go cache.state.runWorkerWithTicks(ticks)
-	t.Cleanup(func() {
-		stopWorker(cache.state)
-		select {
-		case <-cache.state.workerDone:
-		case <-time.After(5 * time.Second):
-			t.Fatal("worker did not stop after cleanup pressure test")
-		}
-	})
+	startTestWorker(t, cache.state, ticks)
 
 	clock.Set(cleanupNowUnix)
 	start := make(chan struct{})
@@ -954,7 +946,7 @@ func TestRandomizedOperationsMatchModel(t *testing.T) {
 func TestConcurrentWorkerClearAndMutations(t *testing.T) {
 	cache, clock := newTestCache(600, DefaultConfig())
 	ticks := make(chan time.Time)
-	go cache.state.runWorkerWithTicks(ticks)
+	startTestWorker(t, cache.state, ticks)
 
 	start := make(chan struct{})
 	var waitGroup sync.WaitGroup
@@ -1014,7 +1006,7 @@ func TestWorkerProcessesTicksAndStops(t *testing.T) {
 	cache.Set("expired", "value", 1)
 
 	ticks := make(chan time.Time)
-	go cache.state.runWorkerWithTicks(ticks)
+	startTestWorker(t, cache.state, ticks)
 	clock.Set(900)
 	ticks <- time.Time{}
 

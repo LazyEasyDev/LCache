@@ -95,6 +95,7 @@ type cacheState struct {
 	entries       map[string]*entry
 	minuteBuckets map[int64]map[string]*entry
 	cleanedMinute int64
+	closed        bool
 	typeCounts    map[reflect.Type]int
 
 	cachedNowUnix atomic.Int64
@@ -162,6 +163,7 @@ func stopWorker(state *cacheState) {
 
 // Set stores value under key for ttlSeconds. A non-positive TTL is a no-op,
 // and a TTL above the configured maximum is clamped. Set accepts nil values.
+// Set is a no-op after Close.
 func (c *Cache) Set(key string, value any, ttlSeconds int64) {
 	state := c.state
 	defer runtime.KeepAlive(c)
@@ -175,6 +177,10 @@ func (c *Cache) Set(key string, value any, ttlSeconds int64) {
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+
+	if state.closed {
+		return
+	}
 
 	record := &entry{
 		value:         value,
@@ -290,17 +296,22 @@ func (c *Cache) Delete(key string) bool {
 }
 
 // Clear atomically removes all entries and resets statistics. The Cache remains
-// usable and its background worker continues running.
+// usable and its background worker continues running. Clear is a no-op after Close.
 func (c *Cache) Clear() {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
 	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.closed {
+		return
+	}
+
 	state.entries = make(map[string]*entry)
 	state.minuteBuckets = make(map[int64]map[string]*entry)
 	state.typeCounts = make(map[reflect.Type]int)
 	state.cleanedMinute = unixMinute(state.clock()) - cleanupGraceMinutes
-	state.mu.Unlock()
 }
 
 // Stats returns an independent snapshot of physically resident entry counts.
@@ -321,6 +332,25 @@ func (c *Cache) Stats() Stats {
 		return stats.ByType[left].Count > stats.ByType[right].Count
 	})
 	return stats
+}
+
+// Close permanently empties the Cache and waits for its background worker to stop.
+// After Close, reads miss, Set and Clear are no-ops, Touch and Delete return false,
+// and Stats is empty. Close is safe to call repeatedly and concurrently with all
+// other operations. A closed Cache cannot be reopened.
+func (c *Cache) Close() {
+	state := c.state
+	defer runtime.KeepAlive(c)
+
+	state.mu.Lock()
+	state.closed = true
+	state.entries = nil
+	state.minuteBuckets = nil
+	state.typeCounts = nil
+	state.mu.Unlock()
+
+	stopWorker(state)
+	<-state.workerDone
 }
 
 func (state *cacheState) addBucketRecord(key string, record *entry) {
@@ -402,13 +432,12 @@ func (state *cacheState) cleanExpiredBatch(safeMinute int64) bool {
 
 func (state *cacheState) runWorker() {
 	ticker := time.NewTicker(clockUpdateInterval)
+	defer close(state.workerDone)
 	defer ticker.Stop()
 	state.runWorkerWithTicks(ticker.C)
 }
 
 func (state *cacheState) runWorkerWithTicks(ticks <-chan time.Time) {
-	defer close(state.workerDone)
-
 	var safeMinute int64
 	cleanupPending := false
 
@@ -424,9 +453,7 @@ func (state *cacheState) runWorkerWithTicks(ticks <-chan time.Time) {
 			case <-state.stop:
 				return
 			case <-ticks:
-				nowUnix := state.clock()
-				state.cachedNowUnix.Store(nowUnix)
-				safeMinute = unixMinute(nowUnix) - cleanupGraceMinutes
+				safeMinute = state.refreshClock()
 			default:
 			}
 
@@ -439,12 +466,16 @@ func (state *cacheState) runWorkerWithTicks(ticks <-chan time.Time) {
 		case <-state.stop:
 			return
 		case <-ticks:
-			nowUnix := state.clock()
-			state.cachedNowUnix.Store(nowUnix)
-			safeMinute = unixMinute(nowUnix) - cleanupGraceMinutes
+			safeMinute = state.refreshClock()
 			cleanupPending = state.cleanExpiredBatch(safeMinute)
 		}
 	}
+}
+
+func (state *cacheState) refreshClock() int64 {
+	nowUnix := state.clock()
+	state.cachedNowUnix.Store(nowUnix)
+	return unixMinute(nowUnix) - cleanupGraceMinutes
 }
 
 func unixMinute(unixSeconds int64) int64 {

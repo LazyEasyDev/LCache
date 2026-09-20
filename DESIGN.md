@@ -24,7 +24,7 @@ or goroutine per key, and keeps cleanup lock holds bounded by a work count.
 
 ## Goals
 
-- Concurrent `Get`, `GetWithTTL`, `Set`, `Touch`, `Delete`, `Clear`, and
+- Concurrent `Get`, `GetWithTTL`, `Set`, `Touch`, `Delete`, `Clear`, `Close`, and
 	`Stats` operations.
 - Expected O(1) lookup, mutation, and expiration-index maintenance.
 - Exact second-based logical expiration using a low-cost cached clock.
@@ -34,6 +34,7 @@ or goroutine per key, and keeps cleanup lock holds bounded by a work count.
 - Exact resident counts grouped by concrete Go type.
 - Automatic worker shutdown after the public cache becomes unreachable.
 - Atomic, constant-time removal of all records with `Clear`.
+- Permanent cache closure and synchronous worker shutdown with `Close`.
 
 ## Non-goals
 
@@ -44,7 +45,6 @@ or goroutine per key, and keeps cleanup lock holds bounded by a work count.
 - Exact-second physical reclamation.
 - Monotonic TTL behavior across wall-clock corrections.
 - Automatic shrinking of Go map backing storage after high-water usage.
-- Synchronous worker shutdown through a public `Close` method.
 
 ## Public Contract
 
@@ -84,6 +84,7 @@ func (c *Cache) GetWithTTL(key string) (
 func (c *Cache) Touch(key string, ttlSeconds int64) bool
 func (c *Cache) Delete(key string) bool
 func (c *Cache) Clear()
+func (c *Cache) Close()
 func (c *Cache) Stats() Stats
 ```
 
@@ -104,7 +105,14 @@ the configured value is outside the inclusive range `1..86400`.
 
 `Clear` atomically replaces all record and index maps with empty maps. Calls
 ordered after it by the cache mutex observe an empty cache. The cache remains
-usable and the worker lifecycle is unchanged.
+usable and the worker lifecycle is unchanged. After `Close`, `Clear` is a no-op.
+
+`Close` permanently empties the cache and waits for its worker and ticker to
+stop. It is safe to call repeatedly and concurrently with all other operations.
+Operations ordered after closure by the cache mutex observe an empty cache:
+`Set` and `Clear` are no-ops, `Get` and `GetWithTTL` return their usual miss
+results, `Touch` and `Delete` return `false`, and `Stats` is empty. A closed
+cache cannot be reopened. Stored values remain caller-owned and are not closed.
 
 `Stats` returns a snapshot with a newly allocated `ByType` slice sorted from
 highest to lowest count; equal-count ordering is unspecified. Mutating that
@@ -154,6 +162,7 @@ type entry struct {
 
 type cacheState struct {
 	mu            sync.RWMutex
+	closed        bool
 	entries       map[string]*entry
 	minuteBuckets map[int64]map[string]*entry
 	cleanedMinute int64
@@ -396,7 +405,26 @@ The worker owns one one-second ticker. On a tick it:
 
 Each batch takes the write lock independently. The worker retains no entry or
 bucket reference across an unlock, allowing `Clear` to replace all structures
-safely.
+safely and `Close` to release them. The worker stops its ticker before closing
+`workerDone` to signal shutdown completion.
+
+### Explicit Shutdown
+
+`Close` takes the write lock, sets `closed`, and releases `entries`,
+`minuteBuckets`, and `typeCounts` by setting them to nil. `Set` checks `closed`
+under the same lock, so a concurrent write either completes before closure
+and is discarded or becomes a no-op. `Clear` also checks `closed` and cannot
+recreate the maps after closure. Reads, `Touch`, `Delete`, and `Stats` observe
+empty maps through their existing locked paths.
+
+After releasing the lock, `Close` calls `stopWorker` and waits for `workerDone`.
+Waiting outside the lock lets any in-progress cleanup batch finish. Every
+concurrent or repeated `Close` waits for shutdown completion; `stopOnce`
+ensures the stop channel is closed only once, including if automatic cleanup
+also requests shutdown.
+
+The cached clock stops advancing with the worker. Because the cache remains
+empty and rejects writes, no expiration decisions depend on this frozen clock.
 
 ### Automatic Shutdown
 
@@ -412,7 +440,7 @@ eventual and is not guaranteed to run before process exit.
 A cached value that points back to its owning `*Cache`, including through a
 nested object or closure, creates a path from the worker state back to the
 wrapper. That path keeps the wrapper reachable and delays its runtime cleanup
-until expiration cleanup, `Delete`, or `Clear` removes the value. Callers must
+until expiration cleanup, `Delete`, `Clear`, or `Close` removes the value. Callers must
 therefore not store the owning cache in its own value graph.
 
 Every public method copies `c.state` locally and defers `runtime.KeepAlive(c)`.
@@ -424,7 +452,8 @@ alter worker lifecycle.
 
 ## Concurrency Model
 
-- `mu` protects `entries`, `minuteBuckets`, `cleanedMinute`, and `typeCounts`.
+- `mu` protects `closed`, `entries`, `minuteBuckets`, `cleanedMinute`, and
+	`typeCounts`.
 - `Get`, `GetWithTTL`, and `Stats` use the read lock.
 - Mutations and cleanup use the write lock.
 - `cachedNowUnix` is published and loaded atomically.
@@ -446,6 +475,7 @@ contention benefit and a design that preserves those cross-index invariants.
 | `Touch` | O(1) |
 | `Delete` | O(1) |
 | `Clear` | O(1) map replacement |
+| `Close` | O(1) map release, plus waiting for worker shutdown |
 | `Stats.Count` | O(t) for `t` represented types |
 | `Stats.ToJSON` | O(t) serialization work |
 | `Stats` | O(t log t) to copy and order represented value types |
@@ -481,6 +511,8 @@ The test suite uses an injected clock rather than long sleeps. It covers:
 - cleanup safety boundaries, partial batches, and empty-minute catch-up
 - stale-record identity protection and backward-clock cursor recovery
 - `Clear` reuse and races with mutation and cleanup
+- `Close` post-closure behavior, repeated and concurrent calls, and waiting for
+	pending worker cleanup
 - randomized operations checked against a reference model
 - model-based fuzzing with independently updated source and cached clocks
 - deadline arithmetic fuzzed against an unsigned-integer model

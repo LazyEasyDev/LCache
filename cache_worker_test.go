@@ -11,7 +11,10 @@ import (
 
 func startTestWorker(test *testing.T, state *cacheState, ticks <-chan time.Time) {
 	test.Helper()
-	go state.runWorkerWithTicks(ticks)
+	go func() {
+		defer close(state.workerDone)
+		state.runWorkerWithTicks(ticks)
+	}()
 	test.Cleanup(func() {
 		stopWorker(state)
 		select {
