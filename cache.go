@@ -1,5 +1,5 @@
-// Package cache provides a concurrent, in-process cache with per-entry TTLs.
-package cache
+// Package LCache provides a concurrent, in-process cache with per-entry TTLs.
+package LCache
 
 import (
 	"encoding/json"

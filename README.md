@@ -1,7 +1,7 @@
 # LCache
 
 LCache is a small, in-process cache for Go. It stores values of any type,
-supports per-entry TTLs, and is safe for concurrent use. It is intended for
+supports per-entry TTLs and concurrent data access. It is intended for
 fast L1 caching inside an application, often in front of a remote cache such
 as Redis.
 
@@ -22,7 +22,7 @@ go get github.com/LazyEasyDev/LCache
 ```
 
 The module path is `github.com/LazyEasyDev/LCache`; the imported package name
-is `cache`.
+is `LCache`.
 
 ## Quick Start
 
@@ -36,12 +36,12 @@ import (
 )
 
 func main() {
-	local := cache.New(cache.DefaultConfig())
-	defer local.Close()
+	LCache.Init(LCache.DefaultConfig())
+	defer LCache.Close()
 
-	local.Set("user:42", "Alice", 60)
+	LCache.Set("user:42", "Alice", 60)
 
-	value, found := local.Get("user:42")
+	value, found := LCache.Get("user:42")
 	if !found {
 		fmt.Println("cache miss")
 		return
@@ -60,10 +60,10 @@ func main() {
 ## Configuration
 
 ```go
-config := cache.DefaultConfig()
+config := LCache.DefaultConfig()
 config.MaxTTLSeconds = 30 * 60
 
-local := cache.New(config)
+LCache.Init(config)
 ```
 
 `MaxTTLSeconds` is the largest TTL accepted by `Set` and `Touch`.
@@ -73,9 +73,47 @@ local := cache.New(config)
 - Zero, negative, and above-default values fall back to 86,400 seconds.
 - A requested TTL above the configured maximum is clamped to that maximum.
 
-`New` always returns a cache and starts one internal maintenance worker.
+`Init` creates the package-level cache and starts one internal maintenance
+worker only when no global instance exists. Repeated calls return the same
+`*Cache`, preserving its entries, configuration, and worker; new configuration
+arguments are ignored. To apply a different configuration, stop all global
+cache users, call package-level `Close`, then call `Init` with the new config.
+
+Use `New` when an application needs independent cache instances:
+
+```go
+local := LCache.New(config)
+defer local.Close()
+```
+
+## Global Cache
+
+After `Init`, the package-level `Set`, `Get`, `GetWithTTL`, `Touch`, `Delete`,
+`Clear`, and `GlobalStats` functions operate on the initialized cache. `Close`
+stops and removes it; a later `Init` creates a fresh cache. Closing the `*Cache`
+returned by `Init` directly does not clear the global reference, so subsequent
+`Init` calls still return that closed instance. Use package-level `LCache.Close()`
+to reset the global instance.
+
+Calls are safe before initialization: writes are no-ops, reads are misses, and
+`GlobalStats` returns an empty snapshot. Once initialized, package-level data
+operations are safe to call concurrently through the cache's internal locking;
+the global facade adds no synchronization.
+
+Callers own the global lifecycle: call `Init` before starting goroutines that
+use the global cache, and wait for all users to finish before shutting it down
+with package-level `Close`. Call `Init` again after `Close` to create a new
+instance. These lifecycle calls must not run concurrently with any package-level
+cache operation, including each other. Overlapping lifecycle and data operations
+can cause a data race.
 
 ## API
+
+The examples below use `local`, a `*Cache` created with `New`. Package-level
+data operations have the same semantics and use the global instance initialized
+by `Init`. Use `LCache.GlobalStats()` instead of `local.Stats()` for global
+statistics. Global initialization and shutdown have the caller-synchronization
+requirements described in [Global Cache](#global-cache).
 
 ### `Set`
 
@@ -121,7 +159,8 @@ deadline and remaining complete TTL seconds. On a miss, it returns
 
 The remaining TTL is calculated from the same cached clock used to decide
 whether the entry is live. It may be zero while `found` is true when the entry
-is in its final partial second.
+is in its final second according to that clock. Clock refresh delays can make
+the reported TTL overestimate the wall-clock time remaining.
 
 ### `Touch`
 
@@ -161,11 +200,13 @@ is a no-op and does not reopen the cache.
 local.Close()
 ```
 
-Permanently empties the cache, releases its references to stored values, and
-waits for the maintenance worker and its ticker to stop. It is safe to call
-repeatedly and concurrently with any other operation.
+`local.Close()` permanently empties the cache, releases its references to stored
+values, and waits for the maintenance worker and its ticker to stop. It is safe
+to call repeatedly and concurrently with other methods on that instance. This
+concurrency guarantee does not apply to package-level `LCache.Close()`; see
+[Global Cache](#global-cache).
 
-After `Close`:
+After `local.Close()`:
 
 - `Set` and `Clear` are no-ops.
 - `Get` returns `nil, false`.
@@ -177,6 +218,8 @@ A closed cache cannot be reopened; use `New` to create another one. Stored
 values remain caller-owned; `Close` does not call their own `Close` methods.
 
 ### `Stats`
+
+This example uses the standard-library `fmt` and `reflect` packages.
 
 ```go
 stats := local.Stats()
@@ -241,15 +284,15 @@ entry may remain visible briefly after its wall-clock deadline if the worker
 has not refreshed the cached time. Scheduler delays or process suspension can
 extend that lag.
 
-When creating a deadline, the cache adds one second after the TTL because
-`time.Now().Unix()` truncates fractional seconds. Under a normally advancing
-clock, an entry therefore remains live for at least the requested number of
-whole seconds.
+When creating a deadline, the cache adds one second to the effective TTL
+(after clamping to the configured maximum) because `time.Now().Unix()`
+truncates fractional seconds. Under a normally advancing clock, an entry
+therefore remains live for at least that effective number of whole seconds.
 
 Logical expiration and physical cleanup are separate:
 
 - `Get`, `GetWithTTL`, `Touch`, and `Delete` use the exact second-based
-	deadline.
+  deadline.
 - The worker removes old records in minute buckets and bounded batches.
 - Physical removal normally occurs within about one minute after the exact
 	deadline, and later if the worker is delayed or has a backlog.
@@ -268,14 +311,16 @@ the cache wrapper reachable from its worker state and delays automatic worker
 shutdown until the entry is physically removed. LCache does not attempt to
 detect indirect references.
 
-Empty strings are valid keys. Methods must be called on a non-nil cache
-returned by `New`.
+Empty strings are valid keys. Methods require a non-nil, initialized `*Cache`
+returned by `New` or `Init`; the zero-value `Cache` is not usable.
 
 ## Concurrency and Lifecycle
 
-All public operations are safe to call concurrently. One cache-level mutex
-keeps entries, expiration buckets, and type counts consistent, while the
-cached clock uses an atomic integer.
+All `*Cache` methods are safe to call concurrently. Package-level data
+operations are also safe for concurrent use while the global instance is
+unchanged, but package-level `Init` and `Close` require caller synchronization.
+One cache-level mutex keeps entries, expiration buckets, and type counts
+consistent, while the cached clock uses an atomic integer.
 
 Share a cache by copying its pointer:
 
@@ -286,10 +331,15 @@ alias := local
 Do not copy the `Cache` struct itself with `copied := *local`. The type carries
 a `noCopy` marker so `go vet` can report accidental copies.
 
-Call `Close` when the cache is no longer needed for deterministic worker
-shutdown. When the `*Cache` wrapper becomes unreachable without an explicit
-`Close`, a runtime cleanup signals the worker to stop as a fallback. Cleanup
-timing is nondeterministic and is not guaranteed before process exit.
+Call `local.Close()` when an independent cache is no longer needed for
+deterministic worker shutdown. When its `*Cache` wrapper becomes unreachable
+without an explicit `Close`, a runtime cleanup may signal the worker to stop
+as a fallback. Cleanup timing is nondeterministic and is not guaranteed before
+process exit.
+
+The global instance remains reachable through the package-level reference, so
+it cannot rely on this cleanup. Stop all global cache users before calling
+`LCache.Close()` to shut it down and clear that reference.
 
 ## Complexity
 

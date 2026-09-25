@@ -72,6 +72,21 @@ type Stats struct {
 func (s Stats) Count(typ reflect.Type) int
 func (s Stats) ToJSON() ([]byte, error)
 
+func Init(config Config) *Cache
+func Set(key string, value any, ttlSeconds int64)
+func Get(key string) (value any, found bool)
+func GetWithTTL(key string) (
+	value any,
+	expiresAtUnix int64,
+	remainingTTLSeconds int64,
+	found bool,
+)
+func Touch(key string, ttlSeconds int64) bool
+func Delete(key string) bool
+func Clear()
+func GlobalStats() Stats
+func Close()
+
 func New(config Config) *Cache
 func (c *Cache) Set(key string, value any, ttlSeconds int64)
 func (c *Cache) Get(key string) (value any, found bool)
@@ -90,6 +105,23 @@ func (c *Cache) Stats() Stats
 
 `New` is infallible. It normalizes `MaxTTLSeconds` to the 24-hour default when
 the configured value is outside the inclusive range `1..86400`.
+
+`Init` creates and assigns the package-level cache only when the global pointer
+is nil. Repeated calls return the existing `*Cache`, ignore the supplied config,
+and preserve its entries and worker. Package-level `Close` synchronously closes
+the instance and clears the global pointer, allowing a later `Init` to create
+a fresh cache with a new config. Calling the returned instance's `Close` method
+directly does not clear the global pointer; `Init` continues to return that
+closed instance until package-level `Close` is called.
+
+The global pointer is not synchronized; package-level data operations delegate
+directly to `*Cache` and rely on its internal locking. Callers must initialize
+before starting global cache users and wait for all users to finish before
+closing it.
+`Init` and package-level `Close` must not run concurrently with any package-level
+cache operation, including each other. Before `Init` and after package-level
+`Close`, writes are no-ops, reads are misses, and `GlobalStats` is empty. `New`
+remains available for independent cache instances.
 
 ### Operation Semantics
 
@@ -459,7 +491,9 @@ alter worker lifecycle.
 - `cachedNowUnix` is published and loaded atomically.
 - The injected `clock` is read directly only when creating deadlines,
   refreshing the cached clock, or resetting the cleanup cursor.
-- There is no package-global mutable state.
+- The optional package-level `*Cache` has no extra synchronization. Callers
+	synchronize `Init` and package-level `Close` with each other and all global
+	cache users; data operations use only the instance's existing locks.
 
 A single lock is intentional: the authoritative record, expiration placement,
 and accounting update form one transaction. Sharding would require a clear
