@@ -3,8 +3,8 @@ package LCache
 
 import (
 	"encoding/json"
+	"hash/maphash"
 	"math"
-	"reflect"
 	"runtime"
 	"sort"
 	"sync"
@@ -14,6 +14,12 @@ import (
 
 // DefaultMaxTTLSeconds is the default upper bound for entry TTLs: 24 hours.
 const DefaultMaxTTLSeconds int64 = 24 * 60 * 60
+
+// DefaultShardCount is the default number of independently locked key maps.
+const DefaultShardCount = 32
+
+// MaxShardCount is the largest supported shard count.
+const MaxShardCount = 1_024
 
 const (
 	clockUpdateInterval = time.Second
@@ -28,82 +34,79 @@ type Config struct {
 	// MaxTTLSeconds is the largest TTL accepted by Set and Touch. Values outside
 	// the range 1 through DefaultMaxTTLSeconds use DefaultMaxTTLSeconds.
 	MaxTTLSeconds int64
+	// ShardCount is the number of independently locked key maps. Values outside
+	// the range 1 through MaxShardCount use DefaultShardCount. One disables sharding.
+	ShardCount int
 }
 
-// DefaultConfig returns a Config with the default 24-hour maximum TTL.
+// DefaultConfig returns a Config with the default maximum TTL and shard count.
 func DefaultConfig() Config {
-	return Config{MaxTTLSeconds: DefaultMaxTTLSeconds}
+	return Config{
+		MaxTTLSeconds: DefaultMaxTTLSeconds,
+		ShardCount:    DefaultShardCount,
+	}
 }
 
-// TypeCount associates a stored value type with its resident entry count.
-type TypeCount struct {
-	Type  reflect.Type
-	Count int
+// TagCount associates a caller-defined tag with its resident entry count.
+type TagCount struct {
+	Tag   string `json:"tag"`
+	Count int    `json:"count"`
 }
 
 // Stats is a snapshot of physically resident cache entries.
 type Stats struct {
 	// Total is the number of physically resident entries, including expired
 	// entries that have not yet been removed by background cleanup.
-	Total int
-	// ByType contains resident entry counts ordered from highest to lowest.
-	// A bare nil value has a nil Type. Equal-count ordering is unspecified.
-	ByType []TypeCount
+	Total int `json:"total"`
+	// ByTag contains resident entry counts ordered from highest to lowest.
+	// The empty string is a valid tag. Equal-count ordering is unspecified.
+	ByTag []TagCount `json:"byTag"`
 }
 
-// Count returns the resident entry count for typ. It returns zero when typ is
+// Count returns the resident entry count for tag. It returns zero when tag is
 // absent or when Stats is the zero value.
-func (s Stats) Count(typ reflect.Type) int {
-	for _, typeCount := range s.ByType {
-		if typeCount.Type == typ {
-			return typeCount.Count
+func (s Stats) Count(tag string) int {
+	for _, tagCount := range s.ByTag {
+		if tagCount.Tag == tag {
+			return tagCount.Count
 		}
 	}
 	return 0
 }
 
-// ToJSON encodes the Stats snapshot as JSON while preserving ByType order.
-// Type names are strings, and the type of a bare nil value is JSON null.
+// ToJSON encodes the Stats snapshot as JSON while preserving ByTag order.
+// An empty snapshot encodes ByTag as an empty array rather than null.
 func (s Stats) ToJSON() ([]byte, error) {
-	type jsonTypeCount struct {
-		Type  *string `json:"type"`
-		Count int     `json:"count"`
+	if s.ByTag == nil {
+		s.ByTag = []TagCount{}
 	}
-	type jsonStats struct {
-		Total  int             `json:"total"`
-		ByType []jsonTypeCount `json:"byType"`
-	}
-
-	byType := make([]jsonTypeCount, len(s.ByType))
-	for index, typeCount := range s.ByType {
-		byType[index].Count = typeCount.Count
-		if typeCount.Type != nil {
-			typeName := typeCount.Type.String()
-			byType[index].Type = &typeName
-		}
-	}
-	return json.Marshal(jsonStats{Total: s.Total, ByType: byType})
+	return json.Marshal(s)
 }
 
 type entry struct {
 	value         any
 	expiresAtUnix int64
+	tag           string
 }
 
-type cacheState struct {
+type cacheShard struct {
 	mu            sync.RWMutex
 	entries       map[string]*entry
 	minuteBuckets map[int64]map[string]*entry
 	cleanedMinute int64
 	closed        bool
-	typeCounts    map[reflect.Type]int
+	tagCounts     map[string]int
+}
 
+type cacheState struct {
+	shards        []cacheShard
+	hashSeed      maphash.Seed
 	cachedNowUnix atomic.Int64
-	clock         func() int64
 	maxTTLSeconds int64
 
 	stop       chan struct{}
 	stopOnce   sync.Once
+	clockDone  chan struct{}
 	workerDone chan struct{}
 }
 
@@ -119,40 +122,61 @@ type Cache struct {
 	state  *cacheState
 }
 
-// New creates a Cache and starts its background expiration worker.
+// New creates a Cache and starts its background clock and expiration workers.
 func New(config Config) *Cache {
-	state := newCacheState(config, func() int64 { return time.Now().Unix() })
+	maxTTLSeconds := config.MaxTTLSeconds
+	if maxTTLSeconds < minimumTTLSeconds || maxTTLSeconds > DefaultMaxTTLSeconds {
+		maxTTLSeconds = DefaultMaxTTLSeconds
+	}
+	shardCount := config.ShardCount
+	if shardCount < 1 || shardCount > MaxShardCount {
+		shardCount = DefaultShardCount
+	}
+
+	nowUnix := max(time.Now().Unix(), 0)
+	state := &cacheState{
+		shards:        make([]cacheShard, shardCount),
+		hashSeed:      maphash.MakeSeed(),
+		maxTTLSeconds: maxTTLSeconds,
+		stop:          make(chan struct{}),
+		clockDone:     make(chan struct{}),
+		workerDone:    make(chan struct{}),
+	}
+	for index := range state.shards {
+		shard := &state.shards[index]
+		shard.entries = make(map[string]*entry)
+		shard.minuteBuckets = make(map[int64]map[string]*entry)
+		shard.cleanedMinute = unixMinute(nowUnix) - cleanupGraceMinutes
+		shard.tagCounts = make(map[string]int)
+	}
+	state.cachedNowUnix.Store(nowUnix)
 	cache := &Cache{state: state}
 
 	runtime.AddCleanup(cache, stopWorker, state)
+	go state.runClockUpdate()
 	go state.runWorker()
 
 	return cache
 }
 
-func newCacheState(config Config, clock func() int64) *cacheState {
-	maxTTLSeconds := config.MaxTTLSeconds
-	if maxTTLSeconds < minimumTTLSeconds || maxTTLSeconds > DefaultMaxTTLSeconds {
-		maxTTLSeconds = DefaultMaxTTLSeconds
+func (state *cacheState) shardFor(key string) *cacheShard {
+	if len(state.shards) == 1 {
+		return &state.shards[0]
 	}
+	index := maphash.String(state.hashSeed, key) % uint64(len(state.shards))
+	return &state.shards[index]
+}
 
-	sourceClock := clock
-	clock = func() int64 {
-		return max(sourceClock(), 0)
+func (state *cacheState) lockShards() {
+	for index := range state.shards {
+		state.shards[index].mu.Lock()
 	}
-	nowUnix := clock()
-	state := &cacheState{
-		entries:       make(map[string]*entry),
-		minuteBuckets: make(map[int64]map[string]*entry),
-		cleanedMinute: unixMinute(nowUnix) - cleanupGraceMinutes,
-		typeCounts:    make(map[reflect.Type]int),
-		clock:         clock,
-		maxTTLSeconds: maxTTLSeconds,
-		stop:          make(chan struct{}),
-		workerDone:    make(chan struct{}),
+}
+
+func (state *cacheState) unlockShards() {
+	for index := len(state.shards) - 1; index >= 0; index-- {
+		state.shards[index].mu.Unlock()
 	}
-	state.cachedNowUnix.Store(nowUnix)
-	return state
 }
 
 func stopWorker(state *cacheState) {
@@ -161,42 +185,47 @@ func stopWorker(state *cacheState) {
 	})
 }
 
-// Set stores value under key for ttlSeconds. A non-positive TTL is a no-op,
-// and a TTL above the configured maximum is clamped. Set accepts nil values.
-// Set is a no-op after Close.
-func (c *Cache) Set(key string, value any, ttlSeconds int64) {
+// Set stores value under key for ttlSeconds and groups it under tag in Stats.
+// A non-positive TTL is a no-op, and a TTL above the configured maximum is
+// clamped. Set accepts nil values and empty tags. Replacing a key also replaces
+// its tag. Set is a no-op after Close.
+func (c *Cache) Set(key string, value any, ttlSeconds int64, tag string) {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
 	if ttlSeconds <= 0 {
 		return
 	}
-	if ttlSeconds > state.maxTTLSeconds {
-		ttlSeconds = state.maxTTLSeconds
-	}
+	ttlSeconds = min(ttlSeconds, state.maxTTLSeconds)
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	shard := state.shardFor(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if state.closed {
+	if shard.closed {
 		return
 	}
 
 	record := &entry{
 		value:         value,
-		expiresAtUnix: expirationDeadline(state.clock(), ttlSeconds),
+		expiresAtUnix: expirationDeadline(state.cachedNowUnix.Load(), ttlSeconds),
+		tag:           tag,
 	}
 
-	if previous, found := state.entries[key]; found {
+	if previous, found := shard.entries[key]; found {
 		if unixMinute(previous.expiresAtUnix) != unixMinute(record.expiresAtUnix) {
-			state.removeBucketRecord(key, previous)
+			shard.removeBucketRecord(key, previous)
 		}
-		state.decrementType(reflect.TypeOf(previous.value))
+		if previous.tag != tag {
+			shard.decrementTag(previous.tag)
+			shard.tagCounts[tag]++
+		}
+	} else {
+		shard.tagCounts[tag]++
 	}
 
-	state.entries[key] = record
-	state.addBucketRecord(key, record)
-	state.typeCounts[reflect.TypeOf(record.value)]++
+	shard.entries[key] = record
+	shard.addBucketRecord(key, record)
 }
 
 // Get returns the live value stored under key. It returns nil, false when key
@@ -225,52 +254,54 @@ func (c *Cache) GetWithTTL(key string) (value any, expiresAtUnix, remainingTTLSe
 }
 
 func (state *cacheState) get(key string) (value any, expiresAtUnix, nowUnix int64, found bool) {
-	state.mu.RLock()
-	record, found := state.entries[key]
+	shard := state.shardFor(key)
+	shard.mu.RLock()
+	record, found := shard.entries[key]
 	if !found {
-		state.mu.RUnlock()
+		shard.mu.RUnlock()
 		return nil, 0, 0, false
 	}
 	nowUnix = state.cachedNowUnix.Load()
 	if record.expiresAtUnix <= nowUnix {
-		state.mu.RUnlock()
+		shard.mu.RUnlock()
 		return nil, 0, 0, false
 	}
 	value, expiresAtUnix = record.value, record.expiresAtUnix
-	state.mu.RUnlock()
+	shard.mu.RUnlock()
 	return value, expiresAtUnix, nowUnix, true
 }
 
 // Touch changes the TTL of a live entry and reports whether one exists. A TTL
 // above the configured maximum is clamped. For a live entry, a non-positive
-// TTL leaves the deadline unchanged and returns true.
+// TTL leaves the deadline unchanged and returns true. Touch preserves the tag.
 func (c *Cache) Touch(key string, ttlSeconds int64) bool {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	shard := state.shardFor(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	previous, found := state.entries[key]
-	if !found || previous.expiresAtUnix <= state.cachedNowUnix.Load() {
+	previous, found := shard.entries[key]
+	nowUnix := state.cachedNowUnix.Load()
+	if !found || previous.expiresAtUnix <= nowUnix {
 		return false
 	}
 	if ttlSeconds <= 0 {
 		return true
 	}
-	if ttlSeconds > state.maxTTLSeconds {
-		ttlSeconds = state.maxTTLSeconds
-	}
+	ttlSeconds = min(ttlSeconds, state.maxTTLSeconds)
 
 	record := &entry{
 		value:         previous.value,
-		expiresAtUnix: expirationDeadline(state.clock(), ttlSeconds),
+		expiresAtUnix: expirationDeadline(nowUnix, ttlSeconds),
+		tag:           previous.tag,
 	}
 	if unixMinute(previous.expiresAtUnix) != unixMinute(record.expiresAtUnix) {
-		state.removeBucketRecord(key, previous)
+		shard.removeBucketRecord(key, previous)
 	}
-	state.entries[key] = record
-	state.addBucketRecord(key, record)
+	shard.entries[key] = record
+	shard.addBucketRecord(key, record)
 	return true
 }
 
@@ -280,38 +311,43 @@ func (c *Cache) Delete(key string) bool {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	shard := state.shardFor(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	record, found := state.entries[key]
+	record, found := shard.entries[key]
 	if !found {
 		return false
 	}
 
 	live := record.expiresAtUnix > state.cachedNowUnix.Load()
-	delete(state.entries, key)
-	state.removeBucketRecord(key, record)
-	state.decrementType(reflect.TypeOf(record.value))
+	delete(shard.entries, key)
+	shard.removeBucketRecord(key, record)
+	shard.decrementTag(record.tag)
 	return live
 }
 
 // Clear atomically removes all entries and resets statistics. The Cache remains
-// usable and its background worker continues running. Clear is a no-op after Close.
+// usable and its background workers continue running. Clear is a no-op after Close.
 func (c *Cache) Clear() {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	state.lockShards()
+	defer state.unlockShards()
 
-	if state.closed {
+	if state.shards[0].closed {
 		return
 	}
 
-	state.entries = make(map[string]*entry)
-	state.minuteBuckets = make(map[int64]map[string]*entry)
-	state.typeCounts = make(map[reflect.Type]int)
-	state.cleanedMinute = unixMinute(state.clock()) - cleanupGraceMinutes
+	cleanedMinute := unixMinute(state.cachedNowUnix.Load()) - cleanupGraceMinutes
+	for index := range state.shards {
+		shard := &state.shards[index]
+		shard.entries = make(map[string]*entry)
+		shard.minuteBuckets = make(map[int64]map[string]*entry)
+		shard.tagCounts = make(map[string]int)
+		shard.cleanedMinute = cleanedMinute
+	}
 }
 
 // Stats returns an independent snapshot of physically resident entry counts.
@@ -319,22 +355,32 @@ func (c *Cache) Stats() Stats {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
-	state.mu.RLock()
-	stats := Stats{
-		Total:  len(state.entries),
-		ByType: make([]TypeCount, 0, len(state.typeCounts)),
+	for index := range state.shards {
+		state.shards[index].mu.RLock()
 	}
-	for typ, count := range state.typeCounts {
-		stats.ByType = append(stats.ByType, TypeCount{Type: typ, Count: count})
+	stats := Stats{}
+	tagCounts := make(map[string]int)
+	for index := range state.shards {
+		shard := &state.shards[index]
+		stats.Total += len(shard.entries)
+		for tag, count := range shard.tagCounts {
+			tagCounts[tag] += count
+		}
 	}
-	state.mu.RUnlock()
-	sort.Slice(stats.ByType, func(left, right int) bool {
-		return stats.ByType[left].Count > stats.ByType[right].Count
+	for index := len(state.shards) - 1; index >= 0; index-- {
+		state.shards[index].mu.RUnlock()
+	}
+	stats.ByTag = make([]TagCount, 0, len(tagCounts))
+	for tag, count := range tagCounts {
+		stats.ByTag = append(stats.ByTag, TagCount{Tag: tag, Count: count})
+	}
+	sort.Slice(stats.ByTag, func(left, right int) bool {
+		return stats.ByTag[left].Count > stats.ByTag[right].Count
 	})
 	return stats
 }
 
-// Close permanently empties the Cache and waits for its background worker to stop.
+// Close permanently empties the Cache and waits for its background workers to stop.
 // After Close, reads miss, Set and Clear are no-ops, Touch and Delete return false,
 // and Stats is empty. Close is safe to call repeatedly and concurrently with all
 // other operations. A closed Cache cannot be reopened.
@@ -342,140 +388,143 @@ func (c *Cache) Close() {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
-	state.mu.Lock()
-	state.closed = true
-	state.entries = nil
-	state.minuteBuckets = nil
-	state.typeCounts = nil
-	state.mu.Unlock()
-
 	stopWorker(state)
+	<-state.clockDone
 	<-state.workerDone
+
+	state.lockShards()
+	for index := range state.shards {
+		shard := &state.shards[index]
+		shard.closed = true
+		shard.entries = nil
+		shard.minuteBuckets = nil
+		shard.tagCounts = nil
+	}
+	state.unlockShards()
 }
 
-func (state *cacheState) addBucketRecord(key string, record *entry) {
+func (shard *cacheShard) addBucketRecord(key string, record *entry) {
 	minute := unixMinute(record.expiresAtUnix)
-	if minute <= state.cleanedMinute {
-		state.cleanedMinute = minute - 1
+	if minute <= shard.cleanedMinute {
+		shard.cleanedMinute = minute - 1
 	}
-	bucket := state.minuteBuckets[minute]
+	bucket := shard.minuteBuckets[minute]
 	if bucket == nil {
 		bucket = make(map[string]*entry)
-		state.minuteBuckets[minute] = bucket
+		shard.minuteBuckets[minute] = bucket
 	}
 	bucket[key] = record
 }
 
-func (state *cacheState) removeBucketRecord(key string, record *entry) {
+func (shard *cacheShard) removeBucketRecord(key string, record *entry) {
 	minute := unixMinute(record.expiresAtUnix)
-	bucket := state.minuteBuckets[minute]
+	bucket := shard.minuteBuckets[minute]
 	if bucket[key] != record {
 		return
 	}
 
 	delete(bucket, key)
 	if len(bucket) == 0 {
-		delete(state.minuteBuckets, minute)
+		delete(shard.minuteBuckets, minute)
 	}
 }
 
-func (state *cacheState) decrementType(typ reflect.Type) {
-	count := state.typeCounts[typ]
+func (shard *cacheShard) decrementTag(tag string) {
+	count := shard.tagCounts[tag]
 	if count <= 1 {
-		delete(state.typeCounts, typ)
+		delete(shard.tagCounts, tag)
 		return
 	}
-	state.typeCounts[typ] = count - 1
+	shard.tagCounts[tag] = count - 1
 }
 
-func (state *cacheState) cleanExpiredBatch(safeMinute int64) bool {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	work := 0
-	for state.cleanedMinute < safeMinute {
-		minute := state.cleanedMinute + 1
-		bucket := state.minuteBuckets[minute]
-		if bucket == nil {
-			state.cleanedMinute = minute
-			work++
-			if work >= workerBatchSize {
-				return state.cleanedMinute < safeMinute
+func (state *cacheState) cleanExpired() {
+	safeMinute := unixMinute(state.cachedNowUnix.Load()) - cleanupGraceMinutes
+	for index := range state.shards {
+		shard := &state.shards[index]
+		for {
+			select {
+			case <-state.stop:
+				return
+			default:
 			}
+
+			shard.mu.Lock()
+			if shard.cleanedMinute >= safeMinute {
+				shard.mu.Unlock()
+				break
+			}
+			shard.cleanExpiredBatchLocked(safeMinute)
+			shard.mu.Unlock()
+			runtime.Gosched()
+		}
+	}
+}
+
+func (shard *cacheShard) cleanExpiredBatchLocked(safeMinute int64) {
+	work := 0
+	for shard.cleanedMinute < safeMinute && work < workerBatchSize {
+		minute := shard.cleanedMinute + 1
+		bucket := shard.minuteBuckets[minute]
+		if bucket == nil {
+			shard.cleanedMinute = minute
+			work++
 			continue
 		}
 
 		for key, record := range bucket {
 			if work >= workerBatchSize {
-				return true
+				break
 			}
 
 			delete(bucket, key)
 			work++
-			if state.entries[key] == record {
-				delete(state.entries, key)
-				state.decrementType(reflect.TypeOf(record.value))
+			if shard.entries[key] == record {
+				delete(shard.entries, key)
+				shard.decrementTag(record.tag)
 			}
 		}
 
 		if len(bucket) == 0 {
-			delete(state.minuteBuckets, minute)
-			state.cleanedMinute = minute
-		}
-		if work >= workerBatchSize {
-			return state.cleanedMinute < safeMinute
+			delete(shard.minuteBuckets, minute)
+			shard.cleanedMinute = minute
 		}
 	}
-
-	return false
 }
 
-func (state *cacheState) runWorker() {
+func (state *cacheState) runClockUpdate() {
 	ticker := time.NewTicker(clockUpdateInterval)
-	defer close(state.workerDone)
+	defer close(state.clockDone)
 	defer ticker.Stop()
-	state.runWorkerWithTicks(ticker.C)
-}
-
-func (state *cacheState) runWorkerWithTicks(ticks <-chan time.Time) {
-	var safeMinute int64
-	cleanupPending := false
 
 	for {
-		if cleanupPending {
-			select {
-			case <-state.stop:
-				return
-			default:
-			}
-
-			select {
-			case <-state.stop:
-				return
-			case <-ticks:
-				safeMinute = state.refreshClock()
-			default:
-			}
-
-			cleanupPending = state.cleanExpiredBatch(safeMinute)
-			runtime.Gosched()
-			continue
-		}
-
 		select {
 		case <-state.stop:
 			return
-		case <-ticks:
-			safeMinute = state.refreshClock()
-			cleanupPending = state.cleanExpiredBatch(safeMinute)
+		case <-ticker.C:
+			state.refreshClock()
 		}
 	}
 }
 
-func (state *cacheState) refreshClock() int64 {
-	nowUnix := state.clock()
+func (state *cacheState) runWorker() {
+	ticker := time.NewTicker(time.Minute)
+	defer close(state.workerDone)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-state.stop:
+			return
+		case <-ticker.C:
+			state.cleanExpired()
+		}
+	}
+}
+
+func (state *cacheState) refreshClock() {
+	nowUnix := max(time.Now().Unix(), 0)
 	state.cachedNowUnix.Store(nowUnix)
-	return unixMinute(nowUnix) - cleanupGraceMinutes
 }
 
 func unixMinute(unixSeconds int64) int64 {
@@ -483,12 +532,8 @@ func unixMinute(unixSeconds int64) int64 {
 }
 
 func expirationDeadline(nowUnix, ttlSeconds int64) int64 {
-	if nowUnix > math.MaxInt64-ttlSeconds {
+	if nowUnix >= math.MaxInt64-ttlSeconds {
 		return math.MaxInt64
 	}
-	deadline := nowUnix + ttlSeconds
-	if deadline == math.MaxInt64 {
-		return math.MaxInt64
-	}
-	return deadline + 1
+	return nowUnix + ttlSeconds + 1
 }

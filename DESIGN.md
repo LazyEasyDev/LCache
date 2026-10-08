@@ -15,9 +15,20 @@ LCache separates expiration into two concerns:
 2. **Physical cleanup** reclaims expired records later. One worker scans sparse
    buckets keyed by absolute Unix minute and removes records in bounded batches.
 
-The authoritative key map, expiration index, and type counters are updated
-together under one mutex. Entry metadata is immutable after publication, so a
-pointer comparison can distinguish a current entry from an obsolete record.
+Keys are partitioned by a seeded hash into a configurable number of shards.
+Each shard's authoritative key map, expiration index, and tag counters are
+updated together under its own mutex. Entry metadata is immutable after
+publication, so a pointer comparison can distinguish a current entry from an
+obsolete record. One worker services all shards.
+
+An independent clock worker updates the cached time every second without
+acquiring shard locks. The cleanup worker checks for eligible records every
+minute and drains each shard's eligible work in bounded batches before moving
+to the next shard.
+
+Whole-cache operations acquire every shard lock in index order and release
+them in reverse order. This preserves atomic `Clear`, `Close`, and `Stats`
+without adding a shared lock to normal key operations.
 
 This design gives normal cache operations expected O(1) work, avoids a timer
 or goroutine per key, and keeps cleanup lock holds bounded by a work count.
@@ -31,9 +42,9 @@ or goroutine per key, and keeps cleanup lock holds bounded by a work count.
 - One expiration-index record for every physically resident entry.
 - Direct removal of old expiration placements on replacement and deletion.
 - Bounded cleanup work per write-lock acquisition.
-- Exact resident counts grouped by concrete Go type.
+- Exact resident counts grouped by caller-defined tags.
 - Automatic worker shutdown after the public cache becomes unreachable.
-- Atomic, constant-time removal of all records with `Clear`.
+- Atomic removal of all records with `Clear`, independent of the entry count.
 - Permanent cache closure and synchronous worker shutdown with `Close`.
 
 ## Non-goals
@@ -52,28 +63,31 @@ The exported surface is:
 
 ```go
 const DefaultMaxTTLSeconds int64 = 24 * 60 * 60
+const DefaultShardCount = 32
+const MaxShardCount = 1_024
 
 type Config struct {
 	MaxTTLSeconds int64
+	ShardCount    int
 }
 
 func DefaultConfig() Config
 
-type TypeCount struct {
-	Type  reflect.Type
-	Count int
+type TagCount struct {
+	Tag   string `json:"tag"`
+	Count int    `json:"count"`
 }
 
 type Stats struct {
-	Total  int
-	ByType []TypeCount
+	Total int        `json:"total"`
+	ByTag []TagCount `json:"byTag"`
 }
 
-func (s Stats) Count(typ reflect.Type) int
+func (s Stats) Count(tag string) int
 func (s Stats) ToJSON() ([]byte, error)
 
 func Init(config Config) *Cache
-func Set(key string, value any, ttlSeconds int64)
+func Set(key string, value any, ttlSeconds int64, tag string)
 func Get(key string) (value any, found bool)
 func GetWithTTL(key string) (
 	value any,
@@ -88,7 +102,7 @@ func GlobalStats() Stats
 func Close()
 
 func New(config Config) *Cache
-func (c *Cache) Set(key string, value any, ttlSeconds int64)
+func (c *Cache) Set(key string, value any, ttlSeconds int64, tag string)
 func (c *Cache) Get(key string) (value any, found bool)
 func (c *Cache) GetWithTTL(key string) (
 	value any,
@@ -104,11 +118,14 @@ func (c *Cache) Stats() Stats
 ```
 
 `New` is infallible. It normalizes `MaxTTLSeconds` to the 24-hour default when
-the configured value is outside the inclusive range `1..86400`.
+the configured value is outside the inclusive range `1..86400`. `ShardCount`
+accepts any value in `1..1024`; other values use `DefaultShardCount` (32).
+The count is fixed for the lifetime of the cache. A count of one bypasses the
+routing hash.
 
 `Init` creates and assigns the package-level cache only when the global pointer
 is nil. Repeated calls return the existing `*Cache`, ignore the supplied config,
-and preserve its entries and worker. Package-level `Close` synchronously closes
+and preserve its entries and workers. Package-level `Close` synchronously closes
 the instance and clears the global pointer, allowing a later `Init` to create
 a fresh cache with a new config. Calling the returned instance's `Close` method
 directly does not clear the global pointer; `Init` continues to return that
@@ -129,33 +146,39 @@ remains available for independent cache instances.
 | --- | --- | --- | --- |
 | `Get` | returns value, `true` | returns `nil, false` | returns `nil, false` |
 | `GetWithTTL` | returns value, deadline, remaining TTL, `true` | returns `nil, 0, 0, false` | returns `nil, 0, 0, false` |
-| `Set`, positive TTL | replaces value and deadline | replaces value and deadline | inserts value and deadline |
+| `Set`, positive TTL | replaces value, deadline, and tag | replaces value, deadline, and tag | inserts value, deadline, and tag |
 | `Set`, non-positive TTL | no-op | no-op | no-op |
 | `Touch`, positive TTL | replaces deadline, returns `true` | no-op, returns `false` | returns `false` |
 | `Touch`, non-positive TTL | no-op, returns `true` | no-op, returns `false` | returns `false` |
 | `Delete` | removes record, returns `true` | removes record, returns `false` | returns `false` |
 
-`Clear` atomically replaces all record and index maps with empty maps. Calls
-ordered after it by the cache mutex observe an empty cache. The cache remains
-usable and the worker lifecycle is unchanged. After `Close`, `Clear` is a no-op.
+`Clear` atomically replaces every shard's record and index maps with empty
+maps. Calls ordered after it by their shard lock observe an empty cache. The
+cache remains usable and the worker lifecycle is unchanged. After `Close`,
+`Clear` is a no-op.
 
-`Close` permanently empties the cache and waits for its worker and ticker to
+`Close` permanently empties the cache and waits for both workers and tickers to
 stop. It is safe to call repeatedly and concurrently with all other operations.
-Operations ordered after closure by the cache mutex observe an empty cache:
+Operations ordered after closure by their shard lock observe an empty cache:
 `Set` and `Clear` are no-ops, `Get` and `GetWithTTL` return their usual miss
 results, `Touch` and `Delete` return `false`, and `Stats` is empty. A closed
 cache cannot be reopened. Stored values remain caller-owned and are not closed.
 
-`Stats` returns a snapshot with a newly allocated `ByType` slice sorted from
+`Stats` returns a snapshot with a newly allocated `ByTag` slice sorted from
 highest to lowest count; equal-count ordering is unspecified. Mutating that
 slice cannot affect the cache. `Stats.Count` scans the snapshot and returns
-zero when the type is absent or the snapshot is the zero value. Counts include
+zero when the tag is absent or the snapshot is the zero value. Counts include
 all physically resident records, including logically expired records awaiting
 cleanup.
 
-`Stats.ToJSON` encodes `Total` and the ordered `ByType` slice using lower-case
-JSON field names. Concrete types use `reflect.Type.String()`, and a bare nil
-type is encoded as JSON `null`. The returned bytes are independently allocated.
+`Stats.ToJSON` encodes `Total` as `total` and the ordered `ByTag` slice as
+`byTag`, with `tag` and `count` fields on each item. An empty snapshot encodes
+`byTag` as `[]`, not `null`. The returned bytes are independently allocated.
+
+Tags are explicit, case-sensitive labels supplied to `Set`. The empty string
+is valid and counted. Values of different Go types may share a tag, and values
+of the same type may use different tags. Tags are not part of key identity or
+shard routing. A same-key overwrite replaces its tag; `Touch` preserves it.
 
 ### Keys and Values
 
@@ -190,22 +213,27 @@ The implementation centers on these structures:
 type entry struct {
 	value         any
 	expiresAtUnix int64
+	tag           string
 }
 
-type cacheState struct {
+type cacheShard struct {
 	mu            sync.RWMutex
-	closed        bool
 	entries       map[string]*entry
 	minuteBuckets map[int64]map[string]*entry
 	cleanedMinute int64
-	typeCounts    map[reflect.Type]int
+	closed        bool
+	tagCounts     map[string]int
+}
 
+type cacheState struct {
+	shards        []cacheShard
+	hashSeed      maphash.Seed
 	cachedNowUnix atomic.Int64
-	clock         func() int64
 	maxTTLSeconds int64
 
 	stop       chan struct{}
 	stopOnce   sync.Once
+	clockDone  chan struct{}
 	workerDone chan struct{}
 }
 
@@ -221,31 +249,37 @@ state.
 
 ### Authoritative State
 
-`entries` is the authoritative key-to-record map. `minuteBuckets` is a derived
-expiration index, and `typeCounts` is derived accounting. All three are
-protected by `mu`.
+Within each shard, `entries` is the authoritative key-to-record map.
+`minuteBuckets` is a derived expiration index, and `tagCounts` is derived
+accounting. All three are protected by that shard's `mu`.
+
+`maphash.String` hashes each key using a per-cache random seed. Its result
+modulo the shard count selects the owner. The seed and shard array are immutable
+after construction, so routing requires no synchronization. The empty string
+and arbitrary string bytes are valid keys. A key never moves between shards
+within the same cache.
 
 Every positive `Set` and successful positive `Touch` creates a new `entry`.
-The value and deadline metadata are not changed after the entry is published.
-Type accounting derives each entry's type from `reflect.TypeOf(entry.value)`
-instead of storing it separately. Reference-bearing values may still point to
-mutable data; metadata immutability does not imply deep value immutability.
+The value, deadline, and tag metadata are not changed after the entry is
+published. Accounting uses the stored tag, not reflection on the value.
+Reference-bearing values may still point to mutable data; metadata immutability
+does not imply deep value immutability.
 
 ### Invariants
 
-At every public operation boundary while `mu` is held:
+At every public operation boundary while the owning shard's `mu` is held:
 
 1. Every record in `entries` appears under the same key in exactly one minute
    bucket.
 2. The selected bucket key equals `entry.expiresAtUnix / 60`.
 3. Every bucket record points to the authoritative record for that key.
 4. `minuteBuckets` contains no empty bucket.
-5. `typeCounts[t]` equals the number of resident entries for which
-	`reflect.TypeOf(value) == t`; zero counts are absent.
+5. `tagCounts[tag]` equals the number of resident entries whose stored tag
+   matches; zero counts are absent.
+6. Each key appears only in the shard selected by its routing hash.
 
-A bare nil value has `reflect.TypeOf(value) == nil` and is counted under the
-valid nil key in `map[reflect.Type]int`. A typed nil is counted under its
-concrete type.
+Bare nil and typed nil values are counted under their supplied tag just like
+other values. The sum of tag counts equals the number of resident entries.
 
 ## Time and Expiration
 
@@ -268,22 +302,23 @@ remainingTTLSeconds = expiresAtUnix - cachedNowUnix - 1
 The result can be zero while the entry remains live in its final partial
 second.
 
-`time.Now().Unix()` truncates subsecond time. To ensure at least the requested
-number of whole seconds under a normally advancing clock, `Set` and positive
-`Touch` calculate:
+`Set` and positive `Touch` calculate a deadline from the cached clock with one
+extra second to allow for Unix-second truncation:
 
 ```go
-expiresAtUnix = nowUnix + ttlSeconds + 1
+expiresAtUnix = cachedNowUnix + ttlSeconds + 1
 ```
 
 The calculation saturates at `math.MaxInt64`. TTL input is already capped at
-24 hours, but saturation keeps the helper correct for an abnormal or injected
-clock near the integer limit.
+24 hours, but saturation protects deadline arithmetic if the system clock
+approaches the integer limit. Because the clock is sampled rather than read
+at the moment of each call, this is not a strict minimum wall-clock lifetime.
 
-### Cached Read Clock
+### Cached Clock
 
-`New` initializes `cachedNowUnix` synchronously. The worker refreshes it from
-`state.clock` about once per second using `atomic.Int64`.
+`New` initializes `cachedNowUnix` synchronously. The independent clock worker
+refreshes it from `time.Now().Unix()` about once per second using `atomic.Int64`.
+It acquires no shard locks, so cleanup cannot block clock publication.
 
 `Get`, `GetWithTTL`, `Touch`, and `Delete` use this cached value to decide
 whether an entry is live. They therefore avoid a system clock call, but can
@@ -291,9 +326,15 @@ observe an entry as live briefly after its wall-clock deadline. The normal lag
 is around one second; scheduling delays and process suspension mean there is
 no hard upper bound.
 
-`Set` and positive `Touch` sample `state.clock` directly when creating a new
-deadline. A stale cached read clock therefore cannot shorten a newly assigned
-TTL.
+`Set` and positive `Touch` also use an atomic clock load when creating a
+deadline; `Clear` uses it when resetting cleanup cursors. `Touch` uses the same
+sample to check the old entry and calculate its new deadline. Only construction
+and worker refreshes call `time.Now().Unix()`.
+
+A stale sample can shorten a newly assigned TTL relative to wall-clock time.
+In particular, if clock scheduling is delayed, the next refresh can expire
+an entry before the requested number of seconds has elapsed since its write.
+The extra second does not compensate for arbitrary scheduling delays.
 
 Expiration follows the system wall clock. A backward adjustment can extend or
 revive a physically resident entry. The design does not provide monotonic TTL
@@ -308,44 +349,47 @@ domain.
 For a positive TTL, `Set`:
 
 1. Clamps the TTL to `maxTTLSeconds`.
-2. Acquires `mu` for writing.
-3. Samples the clock and creates a new immutable record.
+2. Selects the key's shard and acquires its `mu` for writing.
+3. Loads the cached clock and creates a new immutable record with the supplied tag.
 4. Removes any previous record's bucket placement only when its expiration
-	minute changes, and decrements the previous record's type count.
-5. Publishes the new record in `entries`, its due-minute bucket, and its type
-   count.
+	minute changes.
+5. Increments the tag count for a new key. If an existing key changes tags,
+	decrements the old tag and increments the new one; same-tag replacements
+	leave counts unchanged regardless of the value's Go type.
+6. Publishes the new record in `entries` and its due-minute bucket.
 
 A non-positive TTL returns before locking and changes nothing, including when
 the key already exists.
 
 ### Touch
 
-`Touch` acquires the write lock and checks the existing record against the
-cached clock. It returns `false` without mutation for an absent or expired
-record. A live record with a non-positive requested TTL returns `true` without
-mutation.
+`Touch` acquires the owning shard's write lock and loads the cached clock once.
+It checks the existing record against that sample and returns `false` without
+mutation for an absent or expired record. A live record with a non-positive
+requested TTL returns `true` without mutation.
 
-For a live record and positive TTL, it creates a new record carrying the same
-value and removes the old bucket placement only when the expiration minute
-changes. It replaces the authoritative pointer and writes the new bucket
-placement, reusing the existing bucket for same-minute updates. Type counts do
-not change.
+For a live record and positive TTL, it uses the same clock sample to create a
+new record carrying the same value and tag. It removes the old bucket placement
+only when the expiration minute changes, replaces the authoritative pointer,
+and writes the new bucket placement, reusing the existing bucket for same-minute
+updates. Tag counts do not change.
 
 ### Delete
 
-`Delete` acquires the write lock and records whether the resident entry is
+`Delete` acquires the owning shard's write lock and records whether the resident entry is
 live. If present, it removes the authoritative entry, its matching bucket
-placement, and its type count. It returns the previously determined live
+placement, and its tag count. It returns the previously determined live
 status. This is why deleting an expired but resident record returns `false`
 while still reclaiming it.
 
 ### Clear
 
-`Clear` swaps `entries`, `minuteBuckets`, and `typeCounts` for new empty maps
-under the write lock. It also resets:
+`Clear` acquires every shard's write lock in index order, then swaps each
+shard's `entries`, `minuteBuckets`, and `tagCounts` for new empty maps. It also
+resets each shard's cursor using one cached-clock load:
 
 ```go
-cleanedMinute = currentUnixMinute - cleanupGraceMinutes
+cleanedMinute = unixMinute(cachedNowUnix) - cleanupGraceMinutes
 ```
 
 The operation does not iterate over old records, call `runtime.GC`, stop the
@@ -374,26 +418,36 @@ backlog.
 
 ### Cleanup Safety Boundary
 
-On each tick, the worker computes:
+At the start of each `cleanExpired` call, the cleanup worker computes one cutoff
+and retains it for the entire pass:
 
 ```go
-safeMinute := unixMinute(nowUnix) - cleanupGraceMinutes
+safeMinute := unixMinute(state.cachedNowUnix.Load()) - cleanupGraceMinutes
 ```
 
 `cleanupGraceMinutes` is 1. A bucket is eligible only when its minute is at or
-before `safeMinute`. At that point every second in the bucket is in the past,
-so cleanup does not need another deadline comparison.
+before `safeMinute`. With no backward clock adjustment during the pass, every
+second in an eligible bucket is in the past, so cleanup does not perform
+another deadline comparison.
 
-An entry normally remains physically resident for up to about one minute
-after its exact deadline. Logical lookups still reject it according to the
-exact deadline and cached second.
+The fixed cutoff has a known wall-clock limitation: if the clock moves backward
+while a pass is running, a newly written entry can be live against the newer
+cached sample yet belong to a bucket eligible under the old cutoff. That pass
+can remove the live entry. Rewinding the cursor on insertion prevents stranded
+buckets, but does not prevent this premature removal.
+
+With minute-based eligibility and a once-per-minute cleanup ticker, an entry
+normally remains physically resident for up to about two minutes after its
+exact deadline. Cleanup backlog and scheduling delays can extend this time.
+Logical lookups still reject it according to the deadline and cached second.
 
 ### Cleanup Cursor and Batches
 
 `cleanedMinute` is the latest minute fully processed. Cleanup walks forward
 through `cleanedMinute + 1` up to `safeMinute`, in ascending order.
 
-One call processes at most `workerBatchSize` units, where a unit is either:
+One shard cleanup batch processes at most `workerBatchSize` units, where a unit
+is either:
 
 - one bucket record removed, or
 - one empty minute advanced.
@@ -403,8 +457,20 @@ does not advance past it. The next batch resumes the same bucket. Empty-minute
 catch-up is also bounded, which prevents a large clock jump from producing one
 unbounded lock hold.
 
+`cleanExpired` visits shards in index order. For each shard it repeatedly takes
+the write lock, compares the cursor with the fixed cutoff, and calls
+`cleanExpiredBatchLocked` until the cursor reaches that cutoff. Both functions
+return no continuation flag; the cursor decides whether another batch is needed.
+
+The write lock is released after each batch. Shutdown is checked before each
+lock acquisition, and `runtime.Gosched` voluntarily yields after unlocking so
+other runnable goroutines have a scheduling opportunity. It does not sleep,
+wait for a ticker, or guarantee fairness. Work is bounded per lock acquisition,
+not per entire pass; a large backlog on one shard can delay cleanup of later
+shards. Clock refreshes proceed independently of this work.
+
 For every selected bucket record, cleanup first removes the source placement.
-It removes `entries[key]` and decrements its type count only when the
+It removes `entries[key]` and decrements its stored tag's count only when the
 authoritative pointer is the same pointer. This identity check prevents an old
 record from deleting a newer same-key value.
 
@@ -415,58 +481,68 @@ cursor.
 
 ## Worker Lifecycle
 
-`New` creates one `cacheState`, registers runtime cleanup on the public wrapper,
-and starts one worker:
+`New` initializes one `cacheState` with the current wall-clock time and the
+configured shards. It then registers runtime cleanup on the public wrapper
+and starts two workers:
 
 ```go
-state := newCacheState(config, clock)
-local := &Cache{state: state}
-runtime.AddCleanup(local, stopWorker, state)
+cache := &Cache{state: state}
+runtime.AddCleanup(cache, stopWorker, state)
+go state.runClockUpdate()
 go state.runWorker()
 ```
 
-The worker owns one one-second ticker. On a tick it:
+The clock worker owns a one-second ticker. On each tick it samples the system
+clock and atomically publishes `cachedNowUnix`, without acquiring shard locks.
+It stops its ticker before closing `clockDone` on exit.
 
-1. Samples the clock and atomically publishes `cachedNowUnix`.
-2. Calculates the latest safe cleanup minute.
-3. Runs one cleanup batch when work is eligible.
-4. Continues pending batches while checking for stop and newer tick events
-   between batches.
-5. Calls `runtime.Gosched` between immediate batches so other goroutines can
-   run.
+The cleanup worker owns a one-minute ticker. On a tick it:
 
-Each batch takes the write lock independently. The worker retains no entry or
-bucket reference across an unlock, allowing `Clear` to replace all structures
-safely and `Close` to release them. The worker stops its ticker before closing
-`workerDone` to signal shutdown completion.
+1. Loads the cached clock once and calculates the pass's fixed cleanup cutoff.
+2. Visits each shard in index order and drains its eligible work in batches.
+3. Checks for shutdown before each batch and stops the pass when requested.
+4. Releases the shard lock and calls `runtime.Gosched` after each batch before
+	continuing immediately, without waiting for another ticker event.
+
+Each shard batch takes its write lock independently. The cleanup worker retains
+no entry or bucket reference across an unlock, allowing `Clear` to replace all
+structures safely and `Close` to release them. It stops its ticker before closing
+`workerDone` to signal cleanup shutdown completion.
 
 ### Explicit Shutdown
 
-`Close` takes the write lock, sets `closed`, and releases `entries`,
-`minuteBuckets`, and `typeCounts` by setting them to nil. `Set` checks `closed`
-under the same lock, so a concurrent write either completes before closure
-and is discarded or becomes a no-op. `Clear` also checks `closed` and cannot
-recreate the maps after closure. Reads, `Touch`, `Delete`, and `Stats` observe
-empty maps through their existing locked paths.
+`Close` performs shutdown in three steps:
 
-After releasing the lock, `Close` calls `stopWorker` and waits for `workerDone`.
-Waiting outside the lock lets any in-progress cleanup batch finish. Every
-concurrent or repeated `Close` waits for shutdown completion; `stopOnce`
-ensures the stop channel is closed only once, including if automatic cleanup
-also requests shutdown.
+1. Calls `stopWorker` to signal both background workers.
+2. Waits for `clockDone` and `workerDone` without holding shard locks, allowing
+	any in-progress cleanup batch to finish against intact maps before the worker
+	observes shutdown.
+3. Acquires every shard's write lock in index order, marks each shard closed,
+	releases its entry, bucket, and tag-count maps, and unlocks in reverse order.
 
-The cached clock stops advancing with the worker. Because the cache remains
-empty and rejects writes, no expiration decisions depend on this frozen clock.
+Cleanup has already stopped when the maps are cleared, so its batches do not
+need a closed-state check. `Set` and `Clear` retain their checks: concurrent
+writes either complete before closure and are discarded or become no-ops,
+and `Clear` cannot reopen the cache. Reads, `Touch`, `Delete`, and `Stats`
+observe empty maps through their existing locked paths after closure.
+
+Every concurrent or repeated `Close` waits for both workers. `stopOnce` ensures
+the stop channel is closed only once, including when automatic cleanup also
+requests shutdown.
+
+The cached clock stops advancing when the clock worker exits. Operations
+overlapping shutdown may still use the final sample until the maps are cleared.
+Before `Close` returns, the cache is empty and rejects further writes.
 
 ### Automatic Shutdown
 
-The worker captures `*cacheState`, never `*Cache`. If it captured the wrapper,
-the wrapper would remain reachable through the worker and its runtime cleanup
-could never run.
+Both workers capture `*cacheState`, never `*Cache`. If either captured the
+wrapper, the wrapper would remain reachable through that worker and its runtime
+cleanup could never run.
 
 When the wrapper becomes unreachable, `runtime.AddCleanup` may invoke
 `stopWorker(state)`. `stopOnce` closes the stop channel at most once, the
-worker exits, and the remaining state becomes reclaimable. Runtime cleanup is
+workers exit, and the remaining state becomes reclaimable. Runtime cleanup is
 eventual and is not guaranteed to run before process exit.
 
 A cached value that points back to its owning `*Cache`, including through a
@@ -484,22 +560,32 @@ alter worker lifecycle.
 
 ## Concurrency Model
 
-- `mu` protects `closed`, `entries`, `minuteBuckets`, `cleanedMinute`, and
-	`typeCounts`.
-- `Get`, `GetWithTTL`, and `Stats` use the read lock.
-- Mutations and cleanup use the write lock.
+- Each shard's `mu` protects its `closed`, `entries`, `minuteBuckets`,
+	`cleanedMinute`, and `tagCounts`.
+- `Get` and `GetWithTTL` use only the owning shard's read lock.
+- Key mutations and cleanup use only the owning shard's write lock.
+- `Stats` acquires all read locks in index order, copies and aggregates counts,
+	releases the locks in reverse order, then sorts the independent snapshot.
+- `Clear` and `Close` acquire all write locks in index order before changing
+	any shard, and release them in reverse order.
 - `cachedNowUnix` is published and loaded atomically.
-- The injected `clock` is read directly only when creating deadlines,
-  refreshing the cached clock, or resetting the cleanup cursor.
+- `time.Now().Unix()` is called only during construction and background clock
+	refreshes. Other operations load the cached sample.
 - The optional package-level `*Cache` has no extra synchronization. Callers
 	synchronize `Init` and package-level `Close` with each other and all global
 	cache users; data operations use only the instance's existing locks.
 
-A single lock is intentional: the authoritative record, expiration placement,
-and accounting update form one transaction. Sharding would require a clear
-contention benefit and a design that preserves those cross-index invariants.
+The authoritative record, expiration placement, and accounting update still
+form one transaction within a shard. Keys routed to different shards can
+proceed independently. Additional hashing can cost more for serial traffic;
+one hot key still contends on one shard. More shards require more metadata and
+more lock acquisitions for whole-cache operations.
 
 ## Complexity and Space
+
+Here `s` is the shard count, `g` is the number of resident tags, and `q` is
+the sum of distinct resident tag counts across individual shards. Key and tag
+hashing also costs work proportional to their byte lengths.
 
 | Path | Expected work |
 | --- | --- |
@@ -508,14 +594,15 @@ contention benefit and a design that preserves those cross-index invariants.
 | `Set` | O(1) |
 | `Touch` | O(1) |
 | `Delete` | O(1) |
-| `Clear` | O(1) map replacement |
-| `Close` | O(1) map release, plus waiting for worker shutdown |
-| `Stats.Count` | O(t) for `t` represented types |
-| `Stats.ToJSON` | O(t) serialization work |
-| `Stats` | O(t log t) to copy and order represented value types |
-| Cleanup | O(m + k) for elapsed minute positions and processed records |
+| `Clear` | O(s) map replacement, independent of entry count |
+| `Close` | O(s) map release, plus waiting for worker shutdown |
+| `Stats.Count` | O(g) for `g` resident tags |
+| `Stats.ToJSON` | O(g), plus tag-string serialization |
+| `Stats` | O(s + q + g log g) to aggregate and order tag counts |
+| Cleanup | O(s + m + k) for a pass's shards, minute positions, and records |
 
-Logical index space is O(n) entries plus O(b) occupied minute buckets. Go map
+Logical index space is O(n + b + s) for entries, occupied minute buckets, and
+shard metadata. Go map
 backing storage may retain a previous high-water allocation after deletions.
 `Clear` replaces the maps, allowing old backing storage to be reclaimed.
 
@@ -532,35 +619,3 @@ backing storage may retain a previous high-water allocation after deletions.
 These are deliberate tradeoffs of a small process-local TTL cache. Applications
 that require strict memory bounds, monotonic deadlines, immediate reclamation,
 or coordinated invalidation need an additional policy or a different cache.
-
-## Verification
-
-The test suite uses an injected clock rather than long sleeps. It covers:
-
-- TTL normalization, clamping, boundary behavior, and integer saturation
-- bare nil, typed nil, pointer, map, and slice values through full entry lifecycles
-- replacement, deletion, and movement between minute buckets
-- same-minute single-entry bucket reuse and allocation benchmarks
-- exact type counts and independent statistics snapshots
-- cleanup safety boundaries, partial batches, and empty-minute catch-up
-- stale-record identity protection and backward-clock cursor recovery
-- `Clear` reuse and races with mutation and cleanup
-- `Close` post-closure behavior, repeated and concurrent calls, and waiting for
-	pending worker cleanup
-- randomized operations checked against a reference model
-- model-based fuzzing with independently updated source and cached clocks
-- deadline arithmetic fuzzed against an unsigned-integer model
-- concurrent operations and expiration-index invariants
-- deterministic worker ticks, pending-cleanup clock refresh and shutdown,
-  concurrent stop requests, and automatic runtime cleanup
-
-Run the standard, race, and static-analysis checks with:
-
-```sh
-go test ./...
-go test -race ./...
-go vet -all ./...
-```
-
-See [README.md](README.md#verification) for stress, fuzz, coverage, and
-allocation-benchmark commands.

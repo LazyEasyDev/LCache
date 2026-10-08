@@ -18,10 +18,11 @@ func Init(config Config) *Cache {
 	}
 }
 
-// Set stores a value in the package-level Cache. It is a no-op before Init.
-func Set(key string, value any, ttlSeconds int64) {
+// Set stores a value and its statistics tag in the package-level Cache.
+// It is a no-op before Init.
+func Set(key string, value any, ttlSeconds int64, tag string) {
 	if globalCache != nil {
-		globalCache.Set(key, value, ttlSeconds)
+		globalCache.Set(key, value, ttlSeconds, tag)
 	}
 }
 
