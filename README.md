@@ -39,9 +39,13 @@ func main() {
 	LCache.Init(LCache.DefaultConfig())
 	defer LCache.Close()
 
-	LCache.Set("user:42", "Alice", 60, "users")
+	item := LCache.NewItem("users", "name").
+		Attr("id", 42).
+		Attr("active", true).
+		Val("Alice")
+	LCache.Set(item, 60)
 
-	value, found := LCache.Get("user:42")
+	value, found := LCache.Get(item.GetKey())
 	if !found {
 		fmt.Println("cache miss")
 		return
@@ -67,7 +71,7 @@ config.ShardCount = 64
 LCache.Init(config)
 ```
 
-`MaxTTLSeconds` is the largest TTL accepted by `Set` and `Touch`.
+`MaxTTLSeconds` is the largest TTL accepted by `Set`, `SetRaw`, and `Touch`.
 
 - The default is 86,400 seconds (24 hours).
 - Valid custom values are from 1 through 86,400 seconds.
@@ -112,8 +116,8 @@ defer local.Close()
 
 ## Global Cache
 
-After `Init`, the package-level `Set`, `Get`, `GetWithTTL`, `Touch`, `Delete`,
-`Clear`, and `GlobalStats` functions operate on the initialized cache. `Close`
+After `Init`, the package-level `Set`, `SetRaw`, `Get`, `GetWithTTL`, `Touch`,
+`Delete`, `Clear`, and `GlobalStats` functions operate on the initialized cache. `Close`
 stops and removes it; a later `Init` creates a fresh cache. Closing the `*Cache`
 returned by `Init` directly does not clear the global reference, so subsequent
 `Init` calls still return that closed instance. Use package-level `LCache.Close()`
@@ -139,33 +143,114 @@ by `Init`. Use `LCache.GlobalStats()` instead of `local.Stats()` for global
 statistics. Global initialization and shutdown have the caller-synchronization
 requirements described in [Global Cache](#global-cache).
 
+### `NewItem`
+
+```go
+item := LCache.NewItem("users", "name")
+```
+
+Returns a `*Item` whose initial key and tag are the supplied string segments
+joined with `:` in order. Both getters above return `"users:name"`. With no
+segments, both return an empty string. The value is initially nil until
+assigned with `Val`. The zero-value `Item` also contains nil and empty strings.
+
+### `Item.Attr`
+
+```go
+item := LCache.NewItem("users", "name").
+	Attr("id", 42).
+	Attr("active", true)
+```
+
+`Attr(name string, value any)` appends an attribute and returns the same
+`*Item` for chaining:
+
+- `item.GetTag()` returns `"users:name:id:active"`.
+- `item.GetKey()` returns `"users:name:id:42:active:true"`.
+
+Constructor segments stay at the beginning, and attributes retain their call
+order. Repeated names append another attribute rather than replacing one.
+Attributes do not change the value to cache. Move attribute pairs from older
+`NewItem` calls into chained `Attr` calls.
+
+Attribute values use `fmt.Sprint` formatting, including `Stringer` methods.
+Colons in tag segments, names, and values are not escaped, and Go types are
+not encoded. For example, integer `42` and string `"42"` produce the same key
+component. Callers must avoid ambiguous strings when distinct items need
+distinct keys.
+
+Attribute values are formatted when `Attr` is called; subsequent mutation of
+those values does not change the generated strings. Another `Attr` call changes
+the item's key and tag but leaves any previously stored entry unchanged.
+Configure items before sharing them, or synchronize `Attr` and `Val` with
+concurrent use of the same item.
+
+### `Item.Val`
+
+```go
+item := LCache.NewItem("users", "name").Attr("id", 42).Val("Alice")
+```
+
+`Val(value any)` assigns the value to cache and returns the same `*Item` for
+chaining. It accepts any Go type, including bare and typed nil values, and
+does not change the generated key or tag. The value is retained directly,
+not cloned. Synchronize `Val` with `Set` and other `Val` calls on the same item.
+Changing the item's value does not update an existing cache entry until the
+next `Set` call.
+
 ### `Set`
 
 ```go
-local.Set(key, value, ttlSeconds, tag)
+local.Set(item, ttlSeconds)
+```
+
+Stores or replaces the current value of a non-nil `*Item` under `item.GetKey()`
+and groups it under `item.GetTag()` in statistics. TTL and lifecycle behavior
+are the same as `SetRaw`. Use `item.GetKey()` with `Get`, `GetWithTTL`, `Touch`,
+and `Delete`. Without a `Val` call, the stored value is nil.
+
+```go
+first := LCache.NewItem("users", "name").Attr("id", 1).Val("Alice")
+second := LCache.NewItem("users", "name").Attr("id", 2).Val("Bob")
+local.Set(first, 60)
+local.Set(second, 60)
+value, found := local.Get(first.GetKey())
+```
+
+These calls create two distinct entries sharing the `"users:name:id"` statistics
+tag. Use `local.Stats().Count(first.GetTag())` to count that group.
+
+### `SetRaw`
+
+```go
+local.SetRaw(tag, key, value, ttlSeconds)
 ```
 
 Stores or replaces a value. Values may have any Go type, including bare or
 typed nil values. A TTL of zero or less is a no-op, so it does not insert a
 new key or replace an existing value or tag.
 
-The required fourth argument is a caller-defined statistics label. Tags are
+The required first argument is a caller-defined statistics label. Tags are
 case-sensitive strings and are not inferred from keys or value types. Use `""`
 when no label is needed; empty tags are counted like any other tag.
 
 ```go
-local.Set("user:1", "Alice", 60, "users")
-local.Set("user:2", "Bob", 60, "users")
+local.SetRaw("users", "user:1", "Alice", 60)
+local.SetRaw("users", "user:2", "Bob", 60)
 ```
 
 Starting from an empty cache, these calls create two entries under the `users`
 tag. Replacing `user:1` under the same tag keeps that count unchanged; replacing
-it with another tag moves its count to the new tag. A tag is not a namespace:
-the same key always replaces the same entry, regardless of its tag.
+it with another tag moves its count to the new tag. With `SetRaw`, a tag is not
+a namespace: the same key always replaces the same entry, regardless of its
+tag. `NewItem` and `Attr` deliberately include tag segments and attributes in
+the generated key.
 
-This is a breaking API change from three-argument `Set` calls. Add a label or
-`""` to each existing call. Statistics now group entries by tag rather than
-Go value type; `Get`, `GetWithTTL`, `Touch`, and `Delete` keep their signatures.
+Existing four-argument `Set` calls must be renamed to `SetRaw` and reordered
+to `SetRaw(tag, key, value, ttlSeconds)`; storage behavior is unchanged.
+Alternatively, build metadata with `NewItem` and `Attr`, assign the value with
+`Val`, and use the two-argument `Set`, updating lookups to use the generated key.
+`Get`, `GetWithTTL`, `Touch`, and `Delete` keep their signatures.
 
 ### `Get`
 
@@ -250,7 +335,7 @@ concurrency guarantee does not apply to package-level `LCache.Close()`; see
 
 After `local.Close()`:
 
-- `Set` and `Clear` are no-ops.
+- `Set`, `SetRaw`, and `Clear` are no-ops.
 - `Get` returns `nil, false`.
 - `GetWithTTL` returns `nil, 0, 0, false`.
 - `Touch` and `Delete` return `false`.
@@ -324,12 +409,12 @@ expiresAtUnix <= cachedNowUnix
 ```
 
 Equality is expired. The cache initializes its clock during construction and
-refreshes it about once per second. `Set`, `Touch`, reads, `Delete`, and `Clear`
-load this cached clock atomically rather than calling `time.Now`. Only
+refreshes it about once per second. `Set`, `SetRaw`, `Touch`, reads, `Delete`,
+and `Clear` load this cached clock atomically rather than calling `time.Now`. Only
 construction and the clock worker sample the system clock. Cleanup runs in a
 separate goroutine and cannot block clock refreshes on shard locks.
 
-`Set` and positive `Touch` create deadlines from the cached sample plus the
+`Set`, `SetRaw`, and positive `Touch` create deadlines from the cached sample plus the
 effective TTL (after clamping) and one extra second for Unix-second truncation.
 TTL timing is approximate relative to wall-clock time, not a strict minimum
 lifetime from the moment of the call.
@@ -413,6 +498,11 @@ hashing also costs work proportional to their byte lengths.
 | `Get` | O(1) |
 | `GetWithTTL` | O(1) |
 | `Set` | O(1) |
+| `SetRaw` | O(1) |
+| `NewItem` | Proportional to tag segment count and joined string bytes |
+| `Item.Attr` | O(key length + tag length), plus value formatting |
+| `Item.Val` | O(1) |
+| `Item.GetTag`, `Item.GetKey` | O(1) |
 | `Touch` | O(1) |
 | `Delete` | O(1) |
 | `Clear` | O(s) map replacement, independent of entry count |

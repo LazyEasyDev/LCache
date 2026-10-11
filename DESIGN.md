@@ -35,7 +35,7 @@ or goroutine per key, and keeps cleanup lock holds bounded by a work count.
 
 ## Goals
 
-- Concurrent `Get`, `GetWithTTL`, `Set`, `Touch`, `Delete`, `Clear`, `Close`, and
+- Concurrent `Get`, `GetWithTTL`, `Set`, `SetRaw`, `Touch`, `Delete`, `Clear`, `Close`, and
 	`Stats` operations.
 - Expected O(1) lookup, mutation, and expiration-index maintenance.
 - Exact second-based logical expiration using a low-cost cached clock.
@@ -73,6 +73,18 @@ type Config struct {
 
 func DefaultConfig() Config
 
+type Item struct {
+	value any
+	tag   string
+	key   string
+}
+
+func NewItem(tagParts ...string) *Item
+func (item *Item) Attr(name string, value any) *Item
+func (item *Item) Val(value any) *Item
+func (item *Item) GetTag() string
+func (item *Item) GetKey() string
+
 type TagCount struct {
 	Tag   string `json:"tag"`
 	Count int    `json:"count"`
@@ -87,7 +99,8 @@ func (s Stats) Count(tag string) int
 func (s Stats) ToJSON() ([]byte, error)
 
 func Init(config Config) *Cache
-func Set(key string, value any, ttlSeconds int64, tag string)
+func Set(item *Item, ttlSeconds int64)
+func SetRaw(tag string, key string, value any, ttlSeconds int64)
 func Get(key string) (value any, found bool)
 func GetWithTTL(key string) (
 	value any,
@@ -102,7 +115,8 @@ func GlobalStats() Stats
 func Close()
 
 func New(config Config) *Cache
-func (c *Cache) Set(key string, value any, ttlSeconds int64, tag string)
+func (c *Cache) Set(item *Item, ttlSeconds int64)
+func (c *Cache) SetRaw(tag string, key string, value any, ttlSeconds int64)
 func (c *Cache) Get(key string) (value any, found bool)
 func (c *Cache) GetWithTTL(key string) (
 	value any,
@@ -140,14 +154,50 @@ cache operation, including each other. Before `Init` and after package-level
 `Close`, writes are no-ops, reads are misses, and `GlobalStats` is empty. `New`
 remains available for independent cache instances.
 
+### Item Construction
+
+`NewItem(tagParts ...string)` returns an opaque `*Item` with a nil value.
+It joins the ordered string segments with `:` to form the initial key and tag.
+No segments produces empty strings. A zero-value `Item` also has a nil value
+and empty strings.
+
+`Attr(name string, value any)` appends an attribute and returns the same `*Item`.
+Names are strings and values may have any type. Constructor segments remain
+the prefix, and attributes retain their call order. Repeated names append
+rather than replacing previous attributes.
+
+After attribute calls, with `baseTag = strings.Join(tagParts, ":")`:
+
+- `GetTag`: `baseTag + ":" + attrName1 + ":" + attrName2 + ...`.
+- `GetKey`: `baseTag + ":" + attrName1 + ":" + fmt.Sprint(attrValue1) + ...`.
+
+For example, `NewItem("users", "name").Attr("id", 42).Attr("active", true)`
+produces tag `users:name:id:active` and key `users:name:id:42:active:true`.
+Each `Attr` formats its value immediately; later mutation of that value does
+not change the generated strings. Tag segments, names, and values use literal
+colons with no escaping or type encoding. Distinct inputs with identical
+string forms can collide, so callers must choose unambiguous inputs.
+
+`Val(value)` sets the value directly without cloning and returns the same
+`*Item` for chaining. It does not change the generated key or tag; `Attr` does
+not change the value. Callers must synchronize item mutations with concurrent
+use of that item. Neither method changes an already stored entry. Another
+`Set` writes using the item's current key, tag, and value, leaving an earlier
+entry intact if the key has changed.
+
+`Set(item, ttlSeconds)` requires a non-nil `*Item` and passes its generated tag,
+key, and current value to `SetRaw(tag, key, value, ttlSeconds)`. The original
+four-argument `Set` is now named `SetRaw` with tag-first arguments and unchanged
+storage behavior.
+
 ### Operation Semantics
 
 | Operation | Live key | Expired key | Missing key |
 | --- | --- | --- | --- |
 | `Get` | returns value, `true` | returns `nil, false` | returns `nil, false` |
 | `GetWithTTL` | returns value, deadline, remaining TTL, `true` | returns `nil, 0, 0, false` | returns `nil, 0, 0, false` |
-| `Set`, positive TTL | replaces value, deadline, and tag | replaces value, deadline, and tag | inserts value, deadline, and tag |
-| `Set`, non-positive TTL | no-op | no-op | no-op |
+| `Set` or `SetRaw`, positive TTL | replaces value, deadline, and tag | replaces value, deadline, and tag | inserts value, deadline, and tag |
+| `Set` or `SetRaw`, non-positive TTL | no-op | no-op | no-op |
 | `Touch`, positive TTL | replaces deadline, returns `true` | no-op, returns `false` | returns `false` |
 | `Touch`, non-positive TTL | no-op, returns `true` | no-op, returns `false` | returns `false` |
 | `Delete` | removes record, returns `true` | removes record, returns `false` | returns `false` |
@@ -160,7 +210,7 @@ cache remains usable and the worker lifecycle is unchanged. After `Close`,
 `Close` permanently empties the cache and waits for both workers and tickers to
 stop. It is safe to call repeatedly and concurrently with all other operations.
 Operations ordered after closure by their shard lock observe an empty cache:
-`Set` and `Clear` are no-ops, `Get` and `GetWithTTL` return their usual miss
+`Set`, `SetRaw`, and `Clear` are no-ops, `Get` and `GetWithTTL` return their usual miss
 results, `Touch` and `Delete` return `false`, and `Stats` is empty. A closed
 cache cannot be reopened. Stored values remain caller-owned and are not closed.
 
@@ -175,10 +225,12 @@ cleanup.
 `byTag`, with `tag` and `count` fields on each item. An empty snapshot encodes
 `byTag` as `[]`, not `null`. The returned bytes are independently allocated.
 
-Tags are explicit, case-sensitive labels supplied to `Set`. The empty string
-is valid and counted. Values of different Go types may share a tag, and values
-of the same type may use different tags. Tags are not part of key identity or
-shard routing. A same-key overwrite replaces its tag; `Touch` preserves it.
+`SetRaw` accepts explicit, case-sensitive tags; `Set` uses `Item.GetTag()`.
+The empty string is valid and counted. Values of different Go types may share
+a tag, and values of the same type may use different tags. Tag metadata does
+not independently affect key identity or shard routing; `NewItem` and `Attr`
+include the tag segments and attributes in the generated key. A same-key overwrite
+replaces its tag; `Touch` preserves it.
 
 ### Keys and Values
 
@@ -344,9 +396,10 @@ domain.
 
 ## Mutation Transactions
 
-### Set
+### Set and SetRaw
 
-For a positive TTL, `Set`:
+`Set` delegates the item's generated tag, generated key, and current value
+to `SetRaw`. For a positive TTL, `SetRaw`:
 
 1. Clamps the TTL to `maxTTLSeconds`.
 2. Selects the key's shard and acquires its `mu` for writing.
@@ -551,9 +604,10 @@ wrapper. That path keeps the wrapper reachable and delays its runtime cleanup
 until expiration cleanup, `Delete`, `Clear`, or `Close` removes the value. Callers must
 therefore not store the owning cache in its own value graph.
 
-Every public method copies `c.state` locally and defers `runtime.KeepAlive(c)`.
-This prevents runtime cleanup from stopping maintenance while a method is
-still operating on the state.
+Every public method that accesses cache state copies `c.state` locally and
+defers `runtime.KeepAlive(c)`. The item-based `Set` delegates to `SetRaw`, which
+retains this protection. This prevents runtime cleanup from stopping maintenance
+while a method is still operating on the state.
 
 `Clear` only removes records. It does not signal the stop channel or otherwise
 alter worker lifecycle.
@@ -592,6 +646,11 @@ hashing also costs work proportional to their byte lengths.
 | `Get` | O(1) |
 | `GetWithTTL` | O(1) |
 | `Set` | O(1) |
+| `SetRaw` | O(1) |
+| `NewItem` | Proportional to tag segment count and joined string bytes |
+| `Item.Attr` | O(key length + tag length), plus value formatting |
+| `Item.Val` | O(1) |
+| `Item.GetTag`, `Item.GetKey` | O(1) |
 | `Touch` | O(1) |
 | `Delete` | O(1) |
 | `Clear` | O(s) map replacement, independent of entry count |

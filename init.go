@@ -18,11 +18,19 @@ func Init(config Config) *Cache {
 	}
 }
 
-// Set stores a value and its statistics tag in the package-level Cache.
+// Set stores a non-nil item in the package-level Cache using its generated key and tag.
 // It is a no-op before Init.
-func Set(key string, value any, ttlSeconds int64, tag string) {
+func Set(item *Item, ttlSeconds int64) {
 	if globalCache != nil {
-		globalCache.Set(key, value, ttlSeconds, tag)
+		globalCache.Set(item, ttlSeconds)
+	}
+}
+
+// SetRaw stores a value and its statistics tag in the package-level Cache.
+// It is a no-op before Init.
+func SetRaw(tag string, key string, value any, ttlSeconds int64) {
+	if globalCache != nil {
+		globalCache.SetRaw(tag, key, value, ttlSeconds)
 	}
 }
 

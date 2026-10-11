@@ -31,8 +31,8 @@ const (
 
 // Config controls Cache behavior.
 type Config struct {
-	// MaxTTLSeconds is the largest TTL accepted by Set and Touch. Values outside
-	// the range 1 through DefaultMaxTTLSeconds use DefaultMaxTTLSeconds.
+	// MaxTTLSeconds is the largest TTL accepted by Set, SetRaw, and Touch.
+	// Values outside the range 1 through DefaultMaxTTLSeconds use DefaultMaxTTLSeconds.
 	MaxTTLSeconds int64
 	// ShardCount is the number of independently locked key maps. Values outside
 	// the range 1 through MaxShardCount use DefaultShardCount. One disables sharding.
@@ -185,11 +185,17 @@ func stopWorker(state *cacheState) {
 	})
 }
 
-// Set stores value under key for ttlSeconds and groups it under tag in Stats.
+// Set stores a non-nil item under its generated key and statistics tag for ttlSeconds.
+// Its TTL and lifecycle behavior are the same as SetRaw.
+func (c *Cache) Set(item *Item, ttlSeconds int64) {
+	c.SetRaw(item.GetTag(), item.GetKey(), item.value, ttlSeconds)
+}
+
+// SetRaw stores value under key for ttlSeconds and groups it under tag in Stats.
 // A non-positive TTL is a no-op, and a TTL above the configured maximum is
-// clamped. Set accepts nil values and empty tags. Replacing a key also replaces
-// its tag. Set is a no-op after Close.
-func (c *Cache) Set(key string, value any, ttlSeconds int64, tag string) {
+// clamped. SetRaw accepts nil values and empty tags. Replacing a key also replaces
+// its tag. SetRaw is a no-op after Close.
+func (c *Cache) SetRaw(tag string, key string, value any, ttlSeconds int64) {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
