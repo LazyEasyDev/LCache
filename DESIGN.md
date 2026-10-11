@@ -11,7 +11,8 @@ Target Go version: 1.25.13.
 LCache separates expiration into two concerns:
 
 1. **Logical expiration** decides whether an operation can observe an entry.
-   It compares an exact Unix-second deadline with a cached current time.
+	It compares an exact Unix-second deadline with a time sample. `Get` samples
+	the system clock; `Touch` and `Delete` use periodically refreshed cached time.
 2. **Physical cleanup** reclaims expired records later. One worker scans sparse
    buckets keyed by absolute Unix minute and removes records in bounded batches.
 
@@ -35,10 +36,10 @@ or goroutine per key, and keeps cleanup lock holds bounded by a work count.
 
 ## Goals
 
-- Concurrent `Get`, `GetWithTTL`, `Set`, `SetRaw`, `Touch`, `Delete`, `Clear`, `Close`, and
+- Concurrent `Get`, `Set`, `Touch`, `Delete`, `Clear`, `Close`, and
 	`Stats` operations.
 - Expected O(1) lookup, mutation, and expiration-index maintenance.
-- Exact second-based logical expiration using a low-cost cached clock.
+- Exact second-based logical expiration and wall-clock-valid lookup snapshots.
 - One expiration-index record for every physically resident entry.
 - Direct removal of old expiration placements on replacement and deletion.
 - Bounded cleanup work per write-lock acquisition.
@@ -73,18 +74,6 @@ type Config struct {
 
 func DefaultConfig() Config
 
-type Item struct {
-	value any
-	tag   string
-	key   string
-}
-
-func NewItem(tagParts ...string) *Item
-func (item *Item) Attr(name string, value any) *Item
-func (item *Item) Val(value any) *Item
-func (item *Item) GetTag() string
-func (item *Item) GetKey() string
-
 type TagCount struct {
 	Tag   string `json:"tag"`
 	Count int    `json:"count"`
@@ -98,16 +87,21 @@ type Stats struct {
 func (s Stats) Count(tag string) int
 func (s Stats) ToJSON() ([]byte, error)
 
+type Result struct {
+	value            any
+	expiresAtUnix    int64
+	remainingSeconds int64
+	found            bool
+}
+
+func (result Result) Val() any
+func (result Result) Found() bool
+func (result Result) ExpiresAtUnix() int64
+func (result Result) RemainingSeconds() int64
+
 func Init(config Config) *Cache
-func Set(item *Item, ttlSeconds int64)
-func SetRaw(tag string, key string, value any, ttlSeconds int64)
-func Get(key string) (value any, found bool)
-func GetWithTTL(key string) (
-	value any,
-	expiresAtUnix int64,
-	remainingTTLSeconds int64,
-	found bool,
-)
+func Set(key string, value any, ttlSeconds int64, tag string)
+func Get(key string) Result
 func Touch(key string, ttlSeconds int64) bool
 func Delete(key string) bool
 func Clear()
@@ -115,15 +109,8 @@ func GlobalStats() Stats
 func Close()
 
 func New(config Config) *Cache
-func (c *Cache) Set(item *Item, ttlSeconds int64)
-func (c *Cache) SetRaw(tag string, key string, value any, ttlSeconds int64)
-func (c *Cache) Get(key string) (value any, found bool)
-func (c *Cache) GetWithTTL(key string) (
-	value any,
-	expiresAtUnix int64,
-	remainingTTLSeconds int64,
-	found bool,
-)
+func (c *Cache) Set(key string, value any, ttlSeconds int64, tag string)
+func (c *Cache) Get(key string) Result
 func (c *Cache) Touch(key string, ttlSeconds int64) bool
 func (c *Cache) Delete(key string) bool
 func (c *Cache) Clear()
@@ -154,53 +141,40 @@ cache operation, including each other. Before `Init` and after package-level
 `Close`, writes are no-ops, reads are misses, and `GlobalStats` is empty. `New`
 remains available for independent cache instances.
 
-### Item Construction
+### Lookup Results
 
-`NewItem(tagParts ...string)` returns an opaque `*Item` with a nil value.
-It joins the ordered string segments with `:` to form the initial key and tag.
-No segments produces empty strings. A zero-value `Item` also has a nil value
-and empty strings.
+`Get` returns a `Result` by value with private fields. It selects the key's
+shard and takes its read lock. A missing record produces a zero-value result.
+For a resident record, it samples `max(time.Now().Unix(), 0)` once and rejects
+a deadline at or before that sample. For a live record, it copies the value
+and deadline and computes positive remaining seconds before releasing the lock.
 
-`Attr(name string, value any)` appends an attribute and returns the same `*Item`.
-Names are strings and values may have any type. Constructor segments remain
-the prefix, and attributes retain their call order. Repeated names append
-rather than replacing previous attributes.
+`Val()` returns the stored value, `Found()` reports a live hit,
+`ExpiresAtUnix()` returns the absolute deadline, and `RemainingSeconds()`
+returns the deadline minus that lookup's Unix-second sample. Missing and
+expired records expose neither a value nor TTL metadata: all result fields
+are zero, with `Found()` false. A stored nil still has `Found()` true.
 
-After attribute calls, with `baseTag = strings.Join(tagParts, ":")`:
-
-- `GetTag`: `baseTag + ":" + attrName1 + ":" + attrName2 + ...`.
-- `GetKey`: `baseTag + ":" + attrName1 + ":" + fmt.Sprint(attrValue1) + ...`.
-
-For example, `NewItem("users", "name").Attr("id", 42).Attr("active", true)`
-produces tag `users:name:id:active` and key `users:name:id:42:active:true`.
-Each `Attr` formats its value immediately; later mutation of that value does
-not change the generated strings. Tag segments, names, and values use literal
-colons with no escaping or type encoding. Distinct inputs with identical
-string forms can collide, so callers must choose unambiguous inputs.
-
-`Val(value)` sets the value directly without cloning and returns the same
-`*Item` for chaining. It does not change the generated key or tag; `Attr` does
-not change the value. Callers must synchronize item mutations with concurrent
-use of that item. Neither method changes an already stored entry. Another
-`Set` writes using the item's current key, tag, and value, leaving an earlier
-entry intact if the key has changed.
-
-`Set(item, ttlSeconds)` requires a non-nil `*Item` and passes its generated tag,
-key, and current value to `SetRaw(tag, key, value, ttlSeconds)`. The original
-four-argument `Set` is now named `SetRaw` with tag-first arguments and unchanged
-storage behavior.
+The methods read only the snapshot; they do not sample time or access cache
+state. Expiration, replacement, `Touch`, `Delete`, `Clear`, and `Close` cannot
+change an existing result. This is not a guarantee of validity when the result
+is inspected later. Reference-bearing values remain caller-owned and are not
+cloned. There is no separate TTL lookup API.
 
 ### Operation Semantics
 
 | Operation | Live key | Expired key | Missing key |
 | --- | --- | --- | --- |
-| `Get` | returns value, `true` | returns `nil, false` | returns `nil, false` |
-| `GetWithTTL` | returns value, deadline, remaining TTL, `true` | returns `nil, 0, 0, false` | returns `nil, 0, 0, false` |
-| `Set` or `SetRaw`, positive TTL | replaces value, deadline, and tag | replaces value, deadline, and tag | inserts value, deadline, and tag |
-| `Set` or `SetRaw`, non-positive TTL | no-op | no-op | no-op |
+| `Get` | returns `Result` with value, deadline, positive remaining seconds, and `Found()` true | returns zero-value `Result` | returns zero-value `Result` |
+| `Set`, positive TTL | replaces value, deadline, and tag | replaces value, deadline, and tag | inserts value, deadline, and tag |
+| `Set`, non-positive TTL | no-op | no-op | no-op |
 | `Touch`, positive TTL | replaces deadline, returns `true` | no-op, returns `false` | returns `false` |
 | `Touch`, non-positive TTL | no-op, returns `true` | no-op, returns `false` | returns `false` |
 | `Delete` | removes record, returns `true` | removes record, returns `false` | returns `false` |
+
+For `Get`, live and expired status uses the system-clock sample taken during
+the lookup. `Touch` and `Delete` retain their cached-clock checks, so they may
+still consider a record live after `Get` rejects it until the clock refreshes.
 
 `Clear` atomically replaces every shard's record and index maps with empty
 maps. Calls ordered after it by their shard lock observe an empty cache. The
@@ -210,8 +184,8 @@ cache remains usable and the worker lifecycle is unchanged. After `Close`,
 `Close` permanently empties the cache and waits for both workers and tickers to
 stop. It is safe to call repeatedly and concurrently with all other operations.
 Operations ordered after closure by their shard lock observe an empty cache:
-`Set`, `SetRaw`, and `Clear` are no-ops, `Get` and `GetWithTTL` return their usual miss
-results, `Touch` and `Delete` return `false`, and `Stats` is empty. A closed
+`Set` and `Clear` are no-ops, `Get` returns a zero-value `Result`,
+`Touch` and `Delete` return `false`, and `Stats` is empty. A closed
 cache cannot be reopened. Stored values remain caller-owned and are not closed.
 
 `Stats` returns a snapshot with a newly allocated `ByTag` slice sorted from
@@ -225,19 +199,17 @@ cleanup.
 `byTag`, with `tag` and `count` fields on each item. An empty snapshot encodes
 `byTag` as `[]`, not `null`. The returned bytes are independently allocated.
 
-`SetRaw` accepts explicit, case-sensitive tags; `Set` uses `Item.GetTag()`.
-The empty string is valid and counted. Values of different Go types may share
-a tag, and values of the same type may use different tags. Tag metadata does
-not independently affect key identity or shard routing; `NewItem` and `Attr`
-include the tag segments and attributes in the generated key. A same-key overwrite
-replaces its tag; `Touch` preserves it.
+Tags are explicit, case-sensitive labels supplied to `Set`. The empty string
+is valid and counted. Values of different Go types may share a tag, and values
+of the same type may use different tags. Tags are not part of key identity or
+shard routing. A same-key overwrite replaces its tag; `Touch` preserves it.
 
 ### Keys and Values
 
 - The empty string is a valid key.
 - Values are accepted as `any`, including bare and typed nil values.
-- A `Get` result must be converted with a caller-side type assertion.
-- The `found` boolean distinguishes a stored nil from a miss.
+- The value returned by `Result.Val()` needs a caller-side type assertion.
+- `Result.Found()` distinguishes a stored nil from a miss.
 - Values are stored directly and are not cloned.
 - Callers own synchronization for mutable pointers, maps, slices, and other
   reference-bearing values.
@@ -256,6 +228,9 @@ alias := local
 Copying the wrapper with `copied := *local` is unsupported because runtime
 cleanup is registered on the original wrapper. A conventional `noCopy` field
 allows `go vet` to detect common accidental copies.
+
+`Result` may be copied freely. It retains no cache pointer and does not refer
+to mutable entry metadata, although its value may contain caller-owned references.
 
 ## Data Model
 
@@ -337,22 +312,24 @@ other values. The sum of tag counts equals the number of resident entries.
 
 ### Exact Deadline
 
-An entry is live precisely when:
+For `Get`, an entry is live precisely when:
 
 ```go
-entry.expiresAtUnix > cachedNowUnix
+nowUnix := max(time.Now().Unix(), 0)
+entry.expiresAtUnix > nowUnix
 ```
 
-Equality is expired. `GetWithTTL` returns the stored deadline as an absolute
-Unix-second value. It also calculates the number of complete seconds remaining
-from the cached clock used for the same lookup:
+Equality is expired. The result retains the stored deadline as an absolute
+Unix-second value and calculates remaining seconds from that same system-clock
+sample:
 
 ```go
-remainingTTLSeconds = expiresAtUnix - cachedNowUnix - 1
+remainingSeconds = expiresAtUnix - nowUnix
 ```
 
-The result can be zero while the entry remains live in its final partial
-second.
+Every hit has positive remaining seconds. The final partial second is counted
+as one second. Misses return a zero-value result rather than expired metadata.
+`Touch` and `Delete` use the same strict deadline comparison against cached time.
 
 `Set` and positive `Touch` calculate a deadline from the cached clock with one
 extra second to allow for Unix-second truncation:
@@ -364,7 +341,9 @@ expiresAtUnix = cachedNowUnix + ttlSeconds + 1
 The calculation saturates at `math.MaxInt64`. TTL input is already capped at
 24 hours, but saturation protects deadline arithmetic if the system clock
 approaches the integer limit. Because the clock is sampled rather than read
-at the moment of each call, this is not a strict minimum wall-clock lifetime.
+at the moment of each write, this is not a strict minimum wall-clock lifetime.
+The padding is unchanged, so a fresh lookup can report one more remaining
+second than the effective TTL supplied to `Set` or `Touch`.
 
 ### Cached Clock
 
@@ -372,20 +351,21 @@ at the moment of each call, this is not a strict minimum wall-clock lifetime.
 refreshes it from `time.Now().Unix()` about once per second using `atomic.Int64`.
 It acquires no shard locks, so cleanup cannot block clock publication.
 
-`Get`, `GetWithTTL`, `Touch`, and `Delete` use this cached value to decide
+`Touch` and `Delete` use this cached value to decide
 whether an entry is live. They therefore avoid a system clock call, but can
 observe an entry as live briefly after its wall-clock deadline. The normal lag
 is around one second; scheduling delays and process suspension mean there is
-no hard upper bound.
+no hard upper bound. `Get` instead samples the system clock under the shard's
+read lock, so its validity check does not depend on clock-worker scheduling.
 
 `Set` and positive `Touch` also use an atomic clock load when creating a
 deadline; `Clear` uses it when resetting cleanup cursors. `Touch` uses the same
-sample to check the old entry and calculate its new deadline. Only construction
-and worker refreshes call `time.Now().Unix()`.
+sample to check the old entry and calculate its new deadline. Construction,
+resident-key `Get` lookups, and worker refreshes call `time.Now().Unix()`.
 
 A stale sample can shorten a newly assigned TTL relative to wall-clock time.
-In particular, if clock scheduling is delayed, the next refresh can expire
-an entry before the requested number of seconds has elapsed since its write.
+In particular, if clock scheduling is delayed, `Get` can immediately reject
+an entry whose new deadline is already expired against the system clock.
 The extra second does not compensate for arbitrary scheduling delays.
 
 Expiration follows the system wall clock. A backward adjustment can extend or
@@ -396,10 +376,9 @@ domain.
 
 ## Mutation Transactions
 
-### Set and SetRaw
+### Set
 
-`Set` delegates the item's generated tag, generated key, and current value
-to `SetRaw`. For a positive TTL, `SetRaw`:
+For a positive TTL, `Set`:
 
 1. Clamps the TTL to `maxTTLSeconds`.
 2. Selects the key's shard and acquires its `mu` for writing.
@@ -492,7 +471,7 @@ buckets, but does not prevent this premature removal.
 With minute-based eligibility and a once-per-minute cleanup ticker, an entry
 normally remains physically resident for up to about two minutes after its
 exact deadline. Cleanup backlog and scheduling delays can extend this time.
-Logical lookups still reject it according to the deadline and cached second.
+`Get` still rejects it according to the deadline and sampled system time.
 
 ### Cleanup Cursor and Batches
 
@@ -583,8 +562,9 @@ Every concurrent or repeated `Close` waits for both workers. `stopOnce` ensures
 the stop channel is closed only once, including when automatic cleanup also
 requests shutdown.
 
-The cached clock stops advancing when the clock worker exits. Operations
-overlapping shutdown may still use the final sample until the maps are cleared.
+The cached clock stops advancing when the clock worker exits. Cached-clock
+operations overlapping shutdown may still use the final sample until the maps
+are cleared. `Get` continues to sample system time for resident records.
 Before `Close` returns, the cache is empty and rejects further writes.
 
 ### Automatic Shutdown
@@ -604,10 +584,9 @@ wrapper. That path keeps the wrapper reachable and delays its runtime cleanup
 until expiration cleanup, `Delete`, `Clear`, or `Close` removes the value. Callers must
 therefore not store the owning cache in its own value graph.
 
-Every public method that accesses cache state copies `c.state` locally and
-defers `runtime.KeepAlive(c)`. The item-based `Set` delegates to `SetRaw`, which
-retains this protection. This prevents runtime cleanup from stopping maintenance
-while a method is still operating on the state.
+Every public `*Cache` method copies `c.state` locally and defers `runtime.KeepAlive(c)`.
+This prevents runtime cleanup from stopping maintenance while a method is
+still operating on the state.
 
 `Clear` only removes records. It does not signal the stop channel or otherwise
 alter worker lifecycle.
@@ -616,15 +595,17 @@ alter worker lifecycle.
 
 - Each shard's `mu` protects its `closed`, `entries`, `minuteBuckets`,
 	`cleanedMinute`, and `tagCounts`.
-- `Get` and `GetWithTTL` use only the owning shard's read lock.
+- `Get` uses only the owning shard's read lock and samples the system clock there.
 - Key mutations and cleanup use only the owning shard's write lock.
 - `Stats` acquires all read locks in index order, copies and aggregates counts,
 	releases the locks in reverse order, then sorts the independent snapshot.
 - `Clear` and `Close` acquire all write locks in index order before changing
 	any shard, and release them in reverse order.
 - `cachedNowUnix` is published and loaded atomically.
-- `time.Now().Unix()` is called only during construction and background clock
-	refreshes. Other operations load the cached sample.
+- `time.Now().Unix()` is called during construction, resident-key `Get` lookups,
+	and background clock refreshes. Other operations load the cached sample.
+- `Result` methods only read copied snapshot fields and do not access cache state
+	or sample time again.
 - The optional package-level `*Cache` has no extra synchronization. Callers
 	synchronize `Init` and package-level `Close` with each other and all global
 	cache users; data operations use only the instance's existing locks.
@@ -644,13 +625,8 @@ hashing also costs work proportional to their byte lengths.
 | Path | Expected work |
 | --- | --- |
 | `Get` | O(1) |
-| `GetWithTTL` | O(1) |
+| `Result` methods | O(1) |
 | `Set` | O(1) |
-| `SetRaw` | O(1) |
-| `NewItem` | Proportional to tag segment count and joined string bytes |
-| `Item.Attr` | O(key length + tag length), plus value formatting |
-| `Item.Val` | O(1) |
-| `Item.GetTag`, `Item.GetKey` | O(1) |
 | `Touch` | O(1) |
 | `Delete` | O(1) |
 | `Clear` | O(s) map replacement, independent of entry count |
@@ -667,7 +643,8 @@ backing storage may retain a previous high-water allocation after deletions.
 
 ## Failure Modes and Limits
 
-- Clock refresh delay can extend logical visibility past wall-clock expiry.
+- Clock refresh delay can assign stale write deadlines and delay `Touch` or
+	`Delete` expiration decisions, but does not delay `Get` expiration checks.
 - Cleanup delay can keep logically expired values and their memory resident.
 - A backward wall-clock change can extend or revive entries still resident.
 - Large mutable values can race independently of the cache's own locking.

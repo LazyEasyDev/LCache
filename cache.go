@@ -31,8 +31,8 @@ const (
 
 // Config controls Cache behavior.
 type Config struct {
-	// MaxTTLSeconds is the largest TTL accepted by Set, SetRaw, and Touch.
-	// Values outside the range 1 through DefaultMaxTTLSeconds use DefaultMaxTTLSeconds.
+	// MaxTTLSeconds is the largest TTL accepted by Set and Touch. Values outside
+	// the range 1 through DefaultMaxTTLSeconds use DefaultMaxTTLSeconds.
 	MaxTTLSeconds int64
 	// ShardCount is the number of independently locked key maps. Values outside
 	// the range 1 through MaxShardCount use DefaultShardCount. One disables sharding.
@@ -81,6 +81,38 @@ func (s Stats) ToJSON() ([]byte, error) {
 		s.ByTag = []TagCount{}
 	}
 	return json.Marshal(s)
+}
+
+// Result is a snapshot of a cache lookup. Its zero value is a miss.
+type Result struct {
+	value            any
+	expiresAtUnix    int64
+	remainingSeconds int64
+	found            bool
+}
+
+// Val returns the stored value, or nil on a miss. A stored nil is a valid hit;
+// use Found to distinguish it from a miss.
+func (result Result) Val() any {
+	return result.value
+}
+
+// Found reports whether the key existed and was unexpired at lookup time.
+// It does not recheck expiration when called later.
+func (result Result) Found() bool {
+	return result.found
+}
+
+// ExpiresAtUnix returns the entry's absolute Unix-second deadline, or zero on a miss.
+func (result Result) ExpiresAtUnix() int64 {
+	return result.expiresAtUnix
+}
+
+// RemainingSeconds returns the TTL at lookup time, or zero on a miss. It is
+// positive for every hit and counts the final partial second as one second.
+// It does not decrease after the lookup.
+func (result Result) RemainingSeconds() int64 {
+	return result.remainingSeconds
 }
 
 type entry struct {
@@ -185,17 +217,11 @@ func stopWorker(state *cacheState) {
 	})
 }
 
-// Set stores a non-nil item under its generated key and statistics tag for ttlSeconds.
-// Its TTL and lifecycle behavior are the same as SetRaw.
-func (c *Cache) Set(item *Item, ttlSeconds int64) {
-	c.SetRaw(item.GetTag(), item.GetKey(), item.value, ttlSeconds)
-}
-
-// SetRaw stores value under key for ttlSeconds and groups it under tag in Stats.
+// Set stores value under key for ttlSeconds and groups it under tag in Stats.
 // A non-positive TTL is a no-op, and a TTL above the configured maximum is
-// clamped. SetRaw accepts nil values and empty tags. Replacing a key also replaces
-// its tag. SetRaw is a no-op after Close.
-func (c *Cache) SetRaw(tag string, key string, value any, ttlSeconds int64) {
+// clamped. Set accepts nil values and empty tags. Replacing a key also replaces
+// its tag. Set is a no-op after Close.
+func (c *Cache) Set(key string, value any, ttlSeconds int64, tag string) {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
@@ -234,52 +260,39 @@ func (c *Cache) SetRaw(tag string, key string, value any, ttlSeconds int64) {
 	shard.addBucketRecord(key, record)
 }
 
-// Get returns the live value stored under key. It returns nil, false when key
-// is absent or expired.
-func (c *Cache) Get(key string) (value any, found bool) {
+// Get returns a snapshot of the live entry under key, using one system-clock
+// sample while holding the key's shard read lock. Missing or expired entries
+// return a zero-value Result.
+func (c *Cache) Get(key string) Result {
 	state := c.state
 	defer runtime.KeepAlive(c)
 
-	value, _, _, found = state.get(key)
-	return value, found
-}
-
-// GetWithTTL returns the live value stored under key, its absolute Unix-second
-// expiration deadline, and its remaining complete TTL seconds. The remaining
-// TTL may be zero while the entry is live in its final partial second. It
-// returns nil, 0, 0, false when key is absent or expired.
-func (c *Cache) GetWithTTL(key string) (value any, expiresAtUnix, remainingTTLSeconds int64, found bool) {
-	state := c.state
-	defer runtime.KeepAlive(c)
-
-	value, expiresAtUnix, nowUnix, found := state.get(key)
-	if !found {
-		return nil, 0, 0, false
-	}
-	return value, expiresAtUnix, expiresAtUnix - nowUnix - 1, true
-}
-
-func (state *cacheState) get(key string) (value any, expiresAtUnix, nowUnix int64, found bool) {
 	shard := state.shardFor(key)
 	shard.mu.RLock()
 	record, found := shard.entries[key]
 	if !found {
 		shard.mu.RUnlock()
-		return nil, 0, 0, false
+		return Result{}
 	}
-	nowUnix = state.cachedNowUnix.Load()
+	nowUnix := max(time.Now().Unix(), 0)
 	if record.expiresAtUnix <= nowUnix {
 		shard.mu.RUnlock()
-		return nil, 0, 0, false
+		return Result{}
 	}
-	value, expiresAtUnix = record.value, record.expiresAtUnix
+	result := Result{
+		value:            record.value,
+		expiresAtUnix:    record.expiresAtUnix,
+		remainingSeconds: record.expiresAtUnix - nowUnix,
+		found:            true,
+	}
 	shard.mu.RUnlock()
-	return value, expiresAtUnix, nowUnix, true
+	return result
 }
 
 // Touch changes the TTL of a live entry and reports whether one exists. A TTL
 // above the configured maximum is clamped. For a live entry, a non-positive
 // TTL leaves the deadline unchanged and returns true. Touch preserves the tag.
+// Live status is checked against the cache's periodically refreshed clock.
 func (c *Cache) Touch(key string, ttlSeconds int64) bool {
 	state := c.state
 	defer runtime.KeepAlive(c)
@@ -313,6 +326,7 @@ func (c *Cache) Touch(key string, ttlSeconds int64) bool {
 
 // Delete physically removes key and reports whether its entry was live. An
 // expired entry may be removed while Delete returns false.
+// Live status is checked against the cache's periodically refreshed clock.
 func (c *Cache) Delete(key string) bool {
 	state := c.state
 	defer runtime.KeepAlive(c)

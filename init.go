@@ -18,37 +18,21 @@ func Init(config Config) *Cache {
 	}
 }
 
-// Set stores a non-nil item in the package-level Cache using its generated key and tag.
+// Set stores a value and its statistics tag in the package-level Cache.
 // It is a no-op before Init.
-func Set(item *Item, ttlSeconds int64) {
+func Set(key string, value any, ttlSeconds int64, tag string) {
 	if globalCache != nil {
-		globalCache.Set(item, ttlSeconds)
+		globalCache.Set(key, value, ttlSeconds, tag)
 	}
 }
 
-// SetRaw stores a value and its statistics tag in the package-level Cache.
-// It is a no-op before Init.
-func SetRaw(tag string, key string, value any, ttlSeconds int64) {
-	if globalCache != nil {
-		globalCache.SetRaw(tag, key, value, ttlSeconds)
-	}
-}
-
-// Get reads a value from the package-level Cache. It returns a miss before Init.
-func Get(key string) (value any, found bool) {
+// Get returns a lookup snapshot from the package-level Cache. It returns a
+// zero-value Result before Init.
+func Get(key string) Result {
 	if globalCache == nil {
-		return nil, false
+		return Result{}
 	}
 	return globalCache.Get(key)
-}
-
-// GetWithTTL reads a value and its TTL from the package-level Cache. It returns
-// a miss before Init.
-func GetWithTTL(key string) (value any, expiresAtUnix, remainingTTLSeconds int64, found bool) {
-	if globalCache == nil {
-		return nil, 0, 0, false
-	}
-	return globalCache.GetWithTTL(key)
 }
 
 // Touch changes the TTL of a value in the package-level Cache. It returns false
